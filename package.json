@@ -1,0 +1,18 @@
+{
+  "name": "ventas-service",
+  "version": "1.0.0",
+  "description": "Microservicio Leoncito: ventas y margen de ventas (Excel -> Postgres/Neon).",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.4.2",
+    "express": "^4.19.2",
+    "multer": "^2.0.1",
+    "pg": "^8.13.1",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+  }
+}

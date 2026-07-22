@@ -274,6 +274,8 @@ app.get('/ventas', async (req, res) => {
       cond.push(`anio_cv = $${params.length}`);
     }
     if (req.query.sede) { params.push(`%${String(req.query.sede)}%`); cond.push(`sede ILIKE $${params.length}`); }
+    // Filtro por vendedor (exacto, sin distinguir mayúsculas) → usado por "Mi Panel".
+    if (req.query.vendedor) { params.push(String(req.query.vendedor).trim()); cond.push(`vendedor ILIKE $${params.length}`); }
     const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
     const { rows } = await pgPool.query(
       `SELECT * FROM ventas ${where} ORDER BY fecha_cv DESC NULLS LAST, codigo_cv DESC`, params

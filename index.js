@@ -289,54 +289,101 @@ app.get('/ventas', async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 🏷️  VENTAS POR CANAL — Call y Realzza (evolutivo propio, tablas separadas)
-// Mismas columnas que `ventas`; cada canal tiene su tabla y su carga independiente.
+// Cada canal tiene su tabla, su carga y su ESQUEMA propio (los Excel difieren):
 //   POST /ventas-call/import    · GET /ventas-call/estado    · GET /ventas-call
 //   POST /ventas-realzza/import · GET /ventas-realzza/estado · GET /ventas-realzza
-// Call    → Mi Panel del asesor lee siempre de aquí (mes actual + meses anteriores),
-//           filtrando por `vendedor` (nombre del asesor CC).
-// Realzza → el "vendedor" es la sede; se filtra por `sede`. Las NC/refacturaciones
-//           se aplican por fecha de afectación: el GET con anio+mes trae las ventas
-//           del mes (CV) ∪ las afectaciones cuyo AF cae en ese mes (mes_af/anio_af).
+// Call    → Excel propio (CodigoCV, FECHAVENTA, Sede, MontoConsolidado, CuotaInicial,
+//           Productos, Cuotas, DocIdentidad, TipoVenta, AsesorVenta, EstadoVenta,
+//           TipoBase, TipoCliente, Entidad). La identidad del asesor es AsesorVenta =
+//           el CÓDIGO CC (→ columna `vendedor`). No hay fecha de afectación separada:
+//           AF = fecha de venta. Mi Panel del asesor lee siempre de aquí.
+// Realzza → Excel de afectaciones (igual que `ventas`): el "vendedor" es la sede y
+//           las NC/refacturaciones se aplican por fecha de afectación (mes_af/anio_af).
+//           El GET con anio+mes trae ventas del mes (CV) ∪ afectaciones (AF) del mes.
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Mapeo del Excel de Ventas Call. AsesorVenta → vendedor (código CC). FECHAVENTA
+// se descompone en dia/mes/anio y se replica en AF (Call no tiene afectación aparte).
+const CALL_COLS = [
+  'codigo_cv', 'dia_cv', 'mes_cv', 'anio_cv', 'sede', 'monto_consolidado', 'cuota_inicial',
+  'productos', 'cuotas', 'doc_identidad', 'tipo_credito', 'vendedor', 'estado_venta',
+  'tipo_base', 'tipo_cliente', 'entidad', 'dia_af', 'mes_af', 'anio_af',
+];
+function mapVentaCallRow(r) {
+  const codigo = toInt(pickCol(r, 'CodigoCV', 'codigo_cv', 'CODIGOCV', 'Codigo CV'));
+  if (codigo === null) return null;
+  const iso = toFechaISO(pickCol(r, 'FECHAVENTA', 'FechaVenta', 'Fecha Venta', 'FECHA VENTA', 'fecha_venta'));
+  let y = null, m = null, d = null;
+  if (iso) { const p = iso.split('-'); y = +p[0]; m = +p[1]; d = +p[2]; }
+  return [
+    codigo, d, m, y,
+    toStr(pickCol(r, 'Sede', 'sede')),
+    toNum(pickCol(r, 'MontoConsolidado', 'monto_consolidado')),
+    toNum(pickCol(r, 'CuotaInicial', 'CuotaIinicial', 'cuota_inicial')),
+    toStr(pickCol(r, 'Productos', 'productos')),
+    toInt(pickCol(r, 'Cuotas', 'cuotas')),
+    toStr(pickCol(r, 'DocIdentidad', 'doc_identidad')),
+    toStr(pickCol(r, 'TipoVenta', 'TipoCredito', 'tipo_credito')),
+    toStr(pickCol(r, 'AsesorVenta', 'asesor_venta', 'vendedor')),   // → código CC
+    toStr(pickCol(r, 'EstadoVenta', 'estado_venta')),
+    toStr(pickCol(r, 'TipoBase', 'tipo_base')),
+    toStr(pickCol(r, 'TipoCliente', 'tipo_cliente')),
+    toStr(pickCol(r, 'Entidad', 'entidad')),
+    d, m, y,   // AF = fecha de venta (Call no tiene afectación separada)
+  ];
+}
+
+// SET del UPSERT a partir de la lista de columnas (todas menos la PK).
+const setDe = (cols) => cols.slice(1).map(c => `${c} = EXCLUDED.${c}`).join(', ') + ', updated_at = now()';
+
 const CANALES = {
-  call:    { tabla: 'ventas_call',    cargas: 'ventas_call_cargas' },
-  realzza: { tabla: 'ventas_realzza', cargas: 'ventas_realzza_cargas' },
+  call: {
+    tabla: 'ventas_call', cargas: 'ventas_call_cargas',
+    cols: CALL_COLS, mapper: mapVentaCallRow, set: setDe(CALL_COLS),
+    ddl: (t) => `
+      CREATE TABLE IF NOT EXISTS ${t} (
+        codigo_cv         BIGINT PRIMARY KEY,
+        dia_cv SMALLINT, mes_cv SMALLINT, anio_cv SMALLINT,
+        sede TEXT, monto_consolidado NUMERIC(14,2), cuota_inicial NUMERIC(14,2),
+        productos TEXT, cuotas INTEGER, doc_identidad TEXT, tipo_credito TEXT,
+        vendedor TEXT, estado_venta TEXT, tipo_base TEXT, tipo_cliente TEXT, entidad TEXT,
+        dia_af SMALLINT, mes_af SMALLINT, anio_af SMALLINT,
+        fecha_cv DATE GENERATED ALWAYS AS (make_date(NULLIF(anio_cv,0),NULLIF(mes_cv,0),NULLIF(dia_cv,0))) STORED,
+        fecha_af DATE GENERATED ALWAYS AS (make_date(NULLIF(anio_af,0),NULLIF(mes_af,0),NULLIF(dia_af,0))) STORED,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS ix_${t}_anio_mes ON ${t} (anio_cv, mes_cv);
+      CREATE INDEX IF NOT EXISTS ix_${t}_vendedor ON ${t} (vendedor);
+      CREATE INDEX IF NOT EXISTS ix_${t}_sede     ON ${t} (sede);`,
+  },
+  realzza: {
+    tabla: 'ventas_realzza', cargas: 'ventas_realzza_cargas',
+    cols: VENTAS_COLS, mapper: mapVentaRow, set: VENTAS_SET,
+    ddl: (t) => `
+      CREATE TABLE IF NOT EXISTS ${t} (
+        codigo_cv         BIGINT PRIMARY KEY,
+        dia_cv SMALLINT, mes_cv SMALLINT, anio_cv SMALLINT,
+        cliente_venta TEXT, sede TEXT, monto_consolidado NUMERIC(14,2), cuota_inicial NUMERIC(14,2),
+        productos TEXT, cuotas INTEGER, doc_identidad TEXT, estado_venta TEXT, entidad TEXT,
+        vendedor TEXT, tipo_credito TEXT, estado_tipo_producto TEXT,
+        dia_af SMALLINT, mes_af SMALLINT, anio_af SMALLINT,
+        fecha_cv DATE GENERATED ALWAYS AS (make_date(NULLIF(anio_cv,0),NULLIF(mes_cv,0),NULLIF(dia_cv,0))) STORED,
+        fecha_af DATE GENERATED ALWAYS AS (make_date(NULLIF(anio_af,0),NULLIF(mes_af,0),NULLIF(dia_af,0))) STORED,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS ix_${t}_anio_mes ON ${t} (anio_cv, mes_cv);
+      CREATE INDEX IF NOT EXISTS ix_${t}_vendedor ON ${t} (vendedor);
+      CREATE INDEX IF NOT EXISTS ix_${t}_sede     ON ${t} (sede);`,
+  },
 };
 const canalSchemaLista = {};
 async function ensureCanalSchema(canal) {
   const c = CANALES[canal];
   if (!pgPool || !c || canalSchemaLista[canal]) return;
   await pgPool.query(`
-    CREATE TABLE IF NOT EXISTS ${c.tabla} (
-      codigo_cv            BIGINT       PRIMARY KEY,
-      dia_cv               SMALLINT,
-      mes_cv               SMALLINT,
-      anio_cv              SMALLINT,
-      cliente_venta        TEXT,
-      sede                 TEXT,
-      monto_consolidado    NUMERIC(14,2),
-      cuota_inicial        NUMERIC(14,2),
-      productos            TEXT,
-      cuotas               INTEGER,
-      doc_identidad        TEXT,
-      estado_venta         TEXT,
-      entidad              TEXT,
-      vendedor             TEXT,
-      tipo_credito         TEXT,
-      estado_tipo_producto TEXT,
-      dia_af               SMALLINT,
-      mes_af               SMALLINT,
-      anio_af              SMALLINT,
-      fecha_cv  DATE GENERATED ALWAYS AS (
-                  make_date(NULLIF(anio_cv,0), NULLIF(mes_cv,0), NULLIF(dia_cv,0))) STORED,
-      fecha_af  DATE GENERATED ALWAYS AS (
-                  make_date(NULLIF(anio_af,0), NULLIF(mes_af,0), NULLIF(dia_af,0))) STORED,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    CREATE INDEX IF NOT EXISTS ix_${c.tabla}_anio_mes ON ${c.tabla} (anio_cv, mes_cv);
-    CREATE INDEX IF NOT EXISTS ix_${c.tabla}_vendedor ON ${c.tabla} (vendedor);
-    CREATE INDEX IF NOT EXISTS ix_${c.tabla}_sede     ON ${c.tabla} (sede);
+    ${c.ddl(c.tabla)}
     CREATE TABLE IF NOT EXISTS ${c.cargas} (
       id           BIGSERIAL PRIMARY KEY,
       cargado_por  TEXT,
@@ -350,15 +397,15 @@ async function ensureCanalSchema(canal) {
   canalSchemaLista[canal] = true;
 }
 
-async function upsertCanalChunk(client, tabla, chunk) {
+async function upsertCanalChunk(client, c, chunk) {
   const params = [];
   const tuples = chunk.map((row, i) => {
-    const base = i * VENTAS_COLS.length;
+    const base = i * c.cols.length;
     params.push(...row);
-    return '(' + VENTAS_COLS.map((_, j) => `$${base + j + 1}`).join(',') + ')';
+    return '(' + c.cols.map((_, j) => `$${base + j + 1}`).join(',') + ')';
   });
-  const sql = `INSERT INTO ${tabla} (${VENTAS_COLS.join(',')}) VALUES ${tuples.join(',')}
-    ON CONFLICT (codigo_cv) DO UPDATE SET ${VENTAS_SET}
+  const sql = `INSERT INTO ${c.tabla} (${c.cols.join(',')}) VALUES ${tuples.join(',')}
+    ON CONFLICT (codigo_cv) DO UPDATE SET ${c.set}
     RETURNING (xmax = 0) AS inserted`;
   const { rows } = await client.query(sql, params);
   let inserted = 0;
@@ -377,7 +424,7 @@ function registrarCanal(canal, ruta) {
       const ws = wb.Sheets[wb.SheetNames[0]];
       const raw = XLSX.utils.sheet_to_json(ws, { defval: '' });
       const byCode = new Map();
-      for (const r of raw) { const m = mapVentaRow(r); if (m) byCode.set(m[0], m); }
+      for (const r of raw) { const m = c.mapper(r); if (m) byCode.set(m[0], m); }
       const rows = Array.from(byCode.values());
       if (rows.length === 0) return res.status(400).json({ success: false, message: 'El archivo no tiene filas válidas (falta la columna CodigoCV).' });
 
@@ -388,7 +435,7 @@ function registrarCanal(canal, ruta) {
         await client.query('BEGIN');
         const CHUNK = 1000;
         for (let i = 0; i < rows.length; i += CHUNK) {
-          const r = await upsertCanalChunk(client, c.tabla, rows.slice(i, i + CHUNK));
+          const r = await upsertCanalChunk(client, c, rows.slice(i, i + CHUNK));
           insertados += r.inserted; actualizados += r.updated;
         }
         await client.query(

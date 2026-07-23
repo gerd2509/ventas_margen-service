@@ -288,6 +288,168 @@ app.get('/ventas', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 🏷️  VENTAS POR CANAL — Call y Realzza (evolutivo propio, tablas separadas)
+// Mismas columnas que `ventas`; cada canal tiene su tabla y su carga independiente.
+//   POST /ventas-call/import    · GET /ventas-call/estado    · GET /ventas-call
+//   POST /ventas-realzza/import · GET /ventas-realzza/estado · GET /ventas-realzza
+// Call    → Mi Panel del asesor lee siempre de aquí (mes actual + meses anteriores),
+//           filtrando por `vendedor` (nombre del asesor CC).
+// Realzza → el "vendedor" es la sede; se filtra por `sede`. Las NC/refacturaciones
+//           se aplican por fecha de afectación: el GET con anio+mes trae las ventas
+//           del mes (CV) ∪ las afectaciones cuyo AF cae en ese mes (mes_af/anio_af).
+// ─────────────────────────────────────────────────────────────────────────────
+const CANALES = {
+  call:    { tabla: 'ventas_call',    cargas: 'ventas_call_cargas' },
+  realzza: { tabla: 'ventas_realzza', cargas: 'ventas_realzza_cargas' },
+};
+const canalSchemaLista = {};
+async function ensureCanalSchema(canal) {
+  const c = CANALES[canal];
+  if (!pgPool || !c || canalSchemaLista[canal]) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS ${c.tabla} (
+      codigo_cv            BIGINT       PRIMARY KEY,
+      dia_cv               SMALLINT,
+      mes_cv               SMALLINT,
+      anio_cv              SMALLINT,
+      cliente_venta        TEXT,
+      sede                 TEXT,
+      monto_consolidado    NUMERIC(14,2),
+      cuota_inicial        NUMERIC(14,2),
+      productos            TEXT,
+      cuotas               INTEGER,
+      doc_identidad        TEXT,
+      estado_venta         TEXT,
+      entidad              TEXT,
+      vendedor             TEXT,
+      tipo_credito         TEXT,
+      estado_tipo_producto TEXT,
+      dia_af               SMALLINT,
+      mes_af               SMALLINT,
+      anio_af              SMALLINT,
+      fecha_cv  DATE GENERATED ALWAYS AS (
+                  make_date(NULLIF(anio_cv,0), NULLIF(mes_cv,0), NULLIF(dia_cv,0))) STORED,
+      fecha_af  DATE GENERATED ALWAYS AS (
+                  make_date(NULLIF(anio_af,0), NULLIF(mes_af,0), NULLIF(dia_af,0))) STORED,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS ix_${c.tabla}_anio_mes ON ${c.tabla} (anio_cv, mes_cv);
+    CREATE INDEX IF NOT EXISTS ix_${c.tabla}_vendedor ON ${c.tabla} (vendedor);
+    CREATE INDEX IF NOT EXISTS ix_${c.tabla}_sede     ON ${c.tabla} (sede);
+    CREATE TABLE IF NOT EXISTS ${c.cargas} (
+      id           BIGSERIAL PRIMARY KEY,
+      cargado_por  TEXT,
+      archivo      TEXT,
+      filas        INTEGER,
+      insertados   INTEGER,
+      actualizados INTEGER,
+      creado_en    TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  canalSchemaLista[canal] = true;
+}
+
+async function upsertCanalChunk(client, tabla, chunk) {
+  const params = [];
+  const tuples = chunk.map((row, i) => {
+    const base = i * VENTAS_COLS.length;
+    params.push(...row);
+    return '(' + VENTAS_COLS.map((_, j) => `$${base + j + 1}`).join(',') + ')';
+  });
+  const sql = `INSERT INTO ${tabla} (${VENTAS_COLS.join(',')}) VALUES ${tuples.join(',')}
+    ON CONFLICT (codigo_cv) DO UPDATE SET ${VENTAS_SET}
+    RETURNING (xmax = 0) AS inserted`;
+  const { rows } = await client.query(sql, params);
+  let inserted = 0;
+  for (const r of rows) if (r.inserted) inserted++;
+  return { inserted, updated: rows.length - inserted };
+}
+
+function registrarCanal(canal, ruta) {
+  const c = CANALES[canal];
+
+  app.post(`/${ruta}/import`, upload.single('archivo'), async (req, res) => {
+    if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada (falta DATABASE_URL).' });
+    if (!req.file) return res.status(400).json({ success: false, message: 'No se recibió archivo (campo "archivo").' });
+    try {
+      const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const raw = XLSX.utils.sheet_to_json(ws, { defval: '' });
+      const byCode = new Map();
+      for (const r of raw) { const m = mapVentaRow(r); if (m) byCode.set(m[0], m); }
+      const rows = Array.from(byCode.values());
+      if (rows.length === 0) return res.status(400).json({ success: false, message: 'El archivo no tiene filas válidas (falta la columna CodigoCV).' });
+
+      await ensureCanalSchema(canal);
+      const client = await pgPool.connect();
+      let insertados = 0, actualizados = 0;
+      try {
+        await client.query('BEGIN');
+        const CHUNK = 1000;
+        for (let i = 0; i < rows.length; i += CHUNK) {
+          const r = await upsertCanalChunk(client, c.tabla, rows.slice(i, i + CHUNK));
+          insertados += r.inserted; actualizados += r.updated;
+        }
+        await client.query(
+          `INSERT INTO ${c.cargas} (cargado_por, archivo, filas, insertados, actualizados) VALUES ($1,$2,$3,$4,$5)`,
+          [toStr(req.body && req.body.cargado_por), req.file.originalname || null, rows.length, insertados, actualizados]
+        );
+        await client.query('COMMIT');
+      } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+
+      res.json({ success: true, filas: rows.length, insertados, actualizados, updated_at: new Date().toISOString() });
+    } catch (error) {
+      console.error(`❌ Error en POST /${ruta}/import:`, error);
+      res.status(500).json({ success: false, message: 'No se pudo importar el archivo.' });
+    }
+  });
+
+  app.get(`/${ruta}/estado`, async (req, res) => {
+    if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+    try {
+      await ensureCanalSchema(canal);
+      const { rows } = await pgPool.query(`SELECT COUNT(*)::int AS total, MAX(updated_at) AS updated_at FROM ${c.tabla}`);
+      const { rows: cargas } = await pgPool.query(
+        `SELECT cargado_por, archivo, filas, insertados, actualizados, creado_en FROM ${c.cargas} ORDER BY id DESC LIMIT 1`
+      );
+      res.json({ success: true, total: rows[0].total, updated_at: rows[0].updated_at, ultimaCarga: cargas[0] || null });
+    } catch (error) {
+      console.error(`❌ Error en GET /${ruta}/estado:`, error);
+      res.status(500).json({ success: false, message: 'No se pudo obtener el estado.' });
+    }
+  });
+
+  app.get(`/${ruta}`, async (req, res) => {
+    if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+    try {
+      await ensureCanalSchema(canal);
+      const cond = [], params = [];
+      const anio = req.query.anio ? parseInt(req.query.anio, 10) : null;
+      const mes  = req.query.mes  ? parseInt(req.query.mes, 10)  : null;
+      if (anio && mes) {
+        params.push(anio); const pa = params.length;
+        params.push(mes);  const pm = params.length;
+        cond.push(`((anio_cv = $${pa} AND mes_cv = $${pm}) OR (anio_af = $${pa} AND mes_af = $${pm}))`);
+      } else if (anio) { params.push(anio); cond.push(`anio_cv = $${params.length}`); }
+      if (req.query.sede)     { params.push(`%${String(req.query.sede)}%`); cond.push(`sede ILIKE $${params.length}`); }
+      if (req.query.vendedor) { params.push(String(req.query.vendedor).trim()); cond.push(`vendedor ILIKE $${params.length}`); }
+      const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
+      const { rows } = await pgPool.query(
+        `SELECT * FROM ${c.tabla} ${where} ORDER BY fecha_cv DESC NULLS LAST, codigo_cv DESC`, params
+      );
+      res.json(rows);
+    } catch (error) {
+      console.error(`❌ Error en GET /${ruta}:`, error);
+      res.status(500).json({ success: false, message: 'No se pudieron obtener las ventas.' });
+    }
+  });
+}
+
+registrarCanal('call', 'ventas-call');
+registrarCanal('realzza', 'ventas-realzza');
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 📊 MARGEN DE VENTAS (reemplazo por codigo_cv; uno-a-muchos por producto)
 // ─────────────────────────────────────────────────────────────────────────────
 const MARGEN_COLS = [

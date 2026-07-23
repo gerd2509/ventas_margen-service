@@ -333,6 +333,36 @@ function mapVentaCallRow(r) {
   ];
 }
 
+// Mapeo del Excel de Ventas Realzza. La identidad es VENDEDOR (se compara con los
+// asesores Realzza registrados). También trae "Asesor Venta" (se guarda aparte).
+// Sin fecha de afectación separada: AF = fecha de venta (las NC restan en su mes).
+const REALZZA_COLS = [
+  'codigo_cv', 'dia_cv', 'mes_cv', 'anio_cv', 'sede', 'monto_consolidado', 'cuota_inicial',
+  'doc_identidad', 'productos', 'cuotas', 'estado_venta', 'asesor_venta', 'vendedor', 'entidad',
+  'dia_af', 'mes_af', 'anio_af',
+];
+function mapVentaRealzzaRow(r) {
+  const codigo = toInt(pickCol(r, 'CodigoCV', 'codigo_cv', 'CODIGOCV', 'Codigo CV'));
+  if (codigo === null) return null;
+  const iso = toFechaISO(pickCol(r, 'FECHAVENTA', 'FechaVenta', 'Fecha Venta', 'FECHA VENTA', 'fecha_venta'));
+  let y = null, m = null, d = null;
+  if (iso) { const p = iso.split('-'); y = +p[0]; m = +p[1]; d = +p[2]; }
+  return [
+    codigo, d, m, y,
+    toStr(pickCol(r, 'SEDE', 'Sede', 'sede')),
+    toNum(pickCol(r, 'MONTO CONSOLIDADO', 'MontoConsolidado', 'monto_consolidado')),
+    toNum(pickCol(r, 'CUOTA INICIAL', 'CuotaInicial', 'cuota_inicial')),
+    toStr(pickCol(r, 'DNI CLIENTE', 'DocIdentidad', 'DNI', 'doc_identidad')),
+    toStr(pickCol(r, 'PRODUCTOS', 'Productos', 'productos')),
+    toInt(pickCol(r, 'Nº CUOTAS', 'N° CUOTAS', 'Nro Cuotas', 'Cuotas', 'cuotas')),
+    toStr(pickCol(r, 'ESTADO VENTA', 'EstadoVenta', 'estado_venta')),
+    toStr(pickCol(r, 'Asesor Venta', 'AsesorVenta', 'asesor_venta')),
+    toStr(pickCol(r, 'VENDEDOR', 'Vendedor', 'vendedor')),   // ← identidad Realzza
+    toStr(pickCol(r, 'ENTIDAD', 'Entidad', 'entidad')),
+    d, m, y,   // AF = fecha de venta (Realzza no tiene afectación separada en el Excel)
+  ];
+}
+
 // SET del UPSERT a partir de la lista de columnas (todas menos la PK).
 const setDe = (cols) => cols.slice(1).map(c => `${c} = EXCLUDED.${c}`).join(', ') + ', updated_at = now()';
 
@@ -359,14 +389,14 @@ const CANALES = {
   },
   realzza: {
     tabla: 'ventas_realzza', cargas: 'ventas_realzza_cargas',
-    cols: VENTAS_COLS, mapper: mapVentaRow, set: VENTAS_SET,
+    cols: REALZZA_COLS, mapper: mapVentaRealzzaRow, set: setDe(REALZZA_COLS),
     ddl: (t) => `
       CREATE TABLE IF NOT EXISTS ${t} (
         codigo_cv         BIGINT PRIMARY KEY,
         dia_cv SMALLINT, mes_cv SMALLINT, anio_cv SMALLINT,
-        cliente_venta TEXT, sede TEXT, monto_consolidado NUMERIC(14,2), cuota_inicial NUMERIC(14,2),
-        productos TEXT, cuotas INTEGER, doc_identidad TEXT, estado_venta TEXT, entidad TEXT,
-        vendedor TEXT, tipo_credito TEXT, estado_tipo_producto TEXT,
+        sede TEXT, monto_consolidado NUMERIC(14,2), cuota_inicial NUMERIC(14,2),
+        doc_identidad TEXT, productos TEXT, cuotas INTEGER, estado_venta TEXT,
+        asesor_venta TEXT, vendedor TEXT, entidad TEXT,
         dia_af SMALLINT, mes_af SMALLINT, anio_af SMALLINT,
         fecha_cv DATE GENERATED ALWAYS AS (make_date(NULLIF(anio_cv,0),NULLIF(mes_cv,0),NULLIF(dia_cv,0))) STORED,
         fecha_af DATE GENERATED ALWAYS AS (make_date(NULLIF(anio_af,0),NULLIF(mes_af,0),NULLIF(dia_af,0))) STORED,

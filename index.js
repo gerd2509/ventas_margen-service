@@ -390,6 +390,8 @@ const CANALES = {
   realzza: {
     tabla: 'ventas_realzza', cargas: 'ventas_realzza_cargas',
     cols: REALZZA_COLS, mapper: mapVentaRealzzaRow, set: setDe(REALZZA_COLS),
+    joinAfect: true,   // cruza con `ventas` (afectaciones) por CodigoCV para AF real
+
     ddl: (t) => `
       CREATE TABLE IF NOT EXISTS ${t} (
         codigo_cv         BIGINT PRIMARY KEY,
@@ -501,20 +503,43 @@ function registrarCanal(canal, ruta) {
     if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
     try {
       await ensureCanalSchema(canal);
+      // Realzza: superpone la AFECTACIÓN autoritativa (tabla `ventas`, con dia/mes/anio_af
+      // reales) sobre cada venta cruzando por CodigoCV. Así el estado y la fecha de
+      // afectación (NC/refacturación/incautación) no dependen solo del Excel Realzza,
+      // y el monto real por mes queda exacto (la NC resta en su mes de afectación real).
+      const j = !!c.joinAfect;
+      const px = j ? 'r.' : '';                          // prefijo de columnas base
+      const afA = j ? 'COALESCE(v.anio_af, r.anio_af)' : 'anio_af';
+      const afM = j ? 'COALESCE(v.mes_af,  r.mes_af)'  : 'mes_af';
       const cond = [], params = [];
       const anio = req.query.anio ? parseInt(req.query.anio, 10) : null;
       const mes  = req.query.mes  ? parseInt(req.query.mes, 10)  : null;
       if (anio && mes) {
         params.push(anio); const pa = params.length;
         params.push(mes);  const pm = params.length;
-        cond.push(`((anio_cv = $${pa} AND mes_cv = $${pm}) OR (anio_af = $${pa} AND mes_af = $${pm}))`);
-      } else if (anio) { params.push(anio); cond.push(`anio_cv = $${params.length}`); }
-      if (req.query.sede)     { params.push(`%${String(req.query.sede)}%`); cond.push(`sede ILIKE $${params.length}`); }
-      if (req.query.vendedor) { params.push(String(req.query.vendedor).trim()); cond.push(`vendedor ILIKE $${params.length}`); }
+        cond.push(`((${px}anio_cv = $${pa} AND ${px}mes_cv = $${pm}) OR (${afA} = $${pa} AND ${afM} = $${pm}))`);
+      } else if (anio) { params.push(anio); cond.push(`${px}anio_cv = $${params.length}`); }
+      if (req.query.sede)     { params.push(`%${String(req.query.sede)}%`); cond.push(`${px}sede ILIKE $${params.length}`); }
+      if (req.query.vendedor) { params.push(String(req.query.vendedor).trim()); cond.push(`${px}vendedor ILIKE $${params.length}`); }
       const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
-      const { rows } = await pgPool.query(
-        `SELECT * FROM ${c.tabla} ${where} ORDER BY fecha_cv DESC NULLS LAST, codigo_cv DESC`, params
-      );
+
+      const sql = j
+        ? `SELECT r.codigo_cv, r.dia_cv, r.mes_cv, r.anio_cv, r.sede, r.monto_consolidado, r.cuota_inicial,
+                  r.doc_identidad, r.productos, r.cuotas, r.asesor_venta, r.vendedor, r.entidad, r.fecha_cv,
+                  COALESCE(v.estado_venta, r.estado_venta) AS estado_venta,
+                  COALESCE(v.dia_af,  r.dia_af)  AS dia_af,
+                  COALESCE(v.mes_af,  r.mes_af)  AS mes_af,
+                  COALESCE(v.anio_af, r.anio_af) AS anio_af,
+                  make_date(NULLIF(COALESCE(v.anio_af, r.anio_af),0),
+                            NULLIF(COALESCE(v.mes_af,  r.mes_af),0),
+                            NULLIF(COALESCE(v.dia_af,  r.dia_af),0)) AS fecha_af
+           FROM ${c.tabla} r
+           LEFT JOIN ventas v ON v.codigo_cv = r.codigo_cv
+           ${where}
+           ORDER BY r.fecha_cv DESC NULLS LAST, r.codigo_cv DESC`
+        : `SELECT * FROM ${c.tabla} ${where} ORDER BY fecha_cv DESC NULLS LAST, codigo_cv DESC`;
+
+      const { rows } = await pgPool.query(sql, params);
       res.json(rows);
     } catch (error) {
       console.error(`❌ Error en GET /${ruta}:`, error);

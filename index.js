@@ -307,10 +307,10 @@ app.get('/ventas', async (req, res) => {
 const CALL_COLS = [
   'codigo_cv', 'dia_cv', 'mes_cv', 'anio_cv', 'sede', 'monto_consolidado', 'cuota_inicial',
   'productos', 'cuotas', 'doc_identidad', 'tipo_credito', 'vendedor', 'estado_venta',
-  'tipo_base', 'tipo_cliente', 'entidad', 'dia_af', 'mes_af', 'anio_af',
+  'dni_txt', 'contacto', 'tipo_base', 'tipo_cliente', 'entidad', 'dia_af', 'mes_af', 'anio_af',
 ];
 function mapVentaCallRow(r) {
-  const codigo = toInt(pickCol(r, 'CodigoCV', 'codigo_cv', 'CODIGOCV', 'Codigo CV'));
+  const codigo = toInt(pickCol(r, 'IDVENTA', 'CodigoCV', 'codigo_cv', 'CODIGOCV', 'Codigo CV'));
   if (codigo === null) return null;
   const iso = toFechaISO(pickCol(r, 'FECHAVENTA', 'FechaVenta', 'Fecha Venta', 'FECHA VENTA', 'fecha_venta'));
   let y = null, m = null, d = null;
@@ -326,6 +326,8 @@ function mapVentaCallRow(r) {
     toStr(pickCol(r, 'TipoVenta', 'TipoCredito', 'tipo_credito')),
     toStr(pickCol(r, 'AsesorVenta', 'asesor_venta', 'vendedor')),   // → código CC
     toStr(pickCol(r, 'EstadoVenta', 'estado_venta')),
+    toStr(pickCol(r, 'DNITXT', 'DNITxt', 'dni_txt')),
+    toStr(pickCol(r, 'CONTACTO', 'Contacto', 'contacto')),
     toStr(pickCol(r, 'TipoBase', 'tipo_base')),
     toStr(pickCol(r, 'TipoCliente', 'tipo_cliente')),
     toStr(pickCol(r, 'Entidad', 'entidad')),
@@ -339,7 +341,7 @@ function mapVentaCallRow(r) {
 const REALZZA_COLS = [
   'codigo_cv', 'dia_cv', 'mes_cv', 'anio_cv', 'sede', 'monto_consolidado', 'cuota_inicial',
   'doc_identidad', 'productos', 'cuotas', 'estado_venta', 'asesor_venta', 'vendedor', 'entidad',
-  'dia_af', 'mes_af', 'anio_af',
+  'tipo_base', 'dia_af', 'mes_af', 'anio_af',
 ];
 function mapVentaRealzzaRow(r) {
   const codigo = toInt(pickCol(r, 'CodigoCV', 'codigo_cv', 'CODIGOCV', 'Codigo CV'));
@@ -359,6 +361,7 @@ function mapVentaRealzzaRow(r) {
     toStr(pickCol(r, 'Asesor Venta', 'AsesorVenta', 'asesor_venta')),
     toStr(pickCol(r, 'VENDEDOR', 'Vendedor', 'vendedor')),   // ← identidad Realzza
     toStr(pickCol(r, 'ENTIDAD', 'Entidad', 'entidad')),
+    toStr(pickCol(r, 'TipoBase', 'TIPO BASE', 'tipo_base')),
     d, m, y,   // AF = fecha de venta (Realzza no tiene afectación separada en el Excel)
   ];
 }
@@ -376,7 +379,8 @@ const CANALES = {
         dia_cv SMALLINT, mes_cv SMALLINT, anio_cv SMALLINT,
         sede TEXT, monto_consolidado NUMERIC(14,2), cuota_inicial NUMERIC(14,2),
         productos TEXT, cuotas INTEGER, doc_identidad TEXT, tipo_credito TEXT,
-        vendedor TEXT, estado_venta TEXT, tipo_base TEXT, tipo_cliente TEXT, entidad TEXT,
+        vendedor TEXT, estado_venta TEXT, dni_txt TEXT, contacto TEXT,
+        tipo_base TEXT, tipo_cliente TEXT, entidad TEXT,
         dia_af SMALLINT, mes_af SMALLINT, anio_af SMALLINT,
         fecha_cv DATE GENERATED ALWAYS AS (make_date(NULLIF(anio_cv,0),NULLIF(mes_cv,0),NULLIF(dia_cv,0))) STORED,
         fecha_af DATE GENERATED ALWAYS AS (make_date(NULLIF(anio_af,0),NULLIF(mes_af,0),NULLIF(dia_af,0))) STORED,
@@ -398,7 +402,7 @@ const CANALES = {
         dia_cv SMALLINT, mes_cv SMALLINT, anio_cv SMALLINT,
         sede TEXT, monto_consolidado NUMERIC(14,2), cuota_inicial NUMERIC(14,2),
         doc_identidad TEXT, productos TEXT, cuotas INTEGER, estado_venta TEXT,
-        asesor_venta TEXT, vendedor TEXT, entidad TEXT,
+        asesor_venta TEXT, vendedor TEXT, entidad TEXT, tipo_base TEXT,
         dia_af SMALLINT, mes_af SMALLINT, anio_af SMALLINT,
         fecha_cv DATE GENERATED ALWAYS AS (make_date(NULLIF(anio_cv,0),NULLIF(mes_cv,0),NULLIF(dia_cv,0))) STORED,
         fecha_af DATE GENERATED ALWAYS AS (make_date(NULLIF(anio_af,0),NULLIF(mes_af,0),NULLIF(dia_af,0))) STORED,
@@ -525,7 +529,7 @@ function registrarCanal(canal, ruta) {
 
       const sql = j
         ? `SELECT r.codigo_cv, r.dia_cv, r.mes_cv, r.anio_cv, r.sede, r.monto_consolidado, r.cuota_inicial,
-                  r.doc_identidad, r.productos, r.cuotas, r.asesor_venta, r.vendedor, r.entidad, r.fecha_cv,
+                  r.doc_identidad, r.productos, r.cuotas, r.asesor_venta, r.vendedor, r.entidad, r.tipo_base, r.fecha_cv,
                   COALESCE(v.estado_venta, r.estado_venta) AS estado_venta,
                   COALESCE(v.dia_af,  r.dia_af)  AS dia_af,
                   COALESCE(v.mes_af,  r.mes_af)  AS mes_af,

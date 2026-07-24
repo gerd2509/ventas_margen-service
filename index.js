@@ -83,7 +83,7 @@ const VENTAS_COLS = [
   'codigo_cv', 'dia_cv', 'mes_cv', 'anio_cv', 'cliente_venta', 'sede',
   'monto_consolidado', 'cuota_inicial', 'productos', 'cuotas', 'doc_identidad',
   'estado_venta', 'entidad', 'vendedor', 'tipo_credito', 'estado_tipo_producto',
-  'dia_af', 'mes_af', 'anio_af',
+  'tipo_cliente', 'dia_af', 'mes_af', 'anio_af',
 ];
 
 let ventasSchemaLista = false;
@@ -107,6 +107,7 @@ async function ensureVentasSchema() {
       vendedor             TEXT,
       tipo_credito         TEXT,
       estado_tipo_producto TEXT,
+      tipo_cliente         TEXT,
       dia_af               SMALLINT,
       mes_af               SMALLINT,
       anio_af              SMALLINT,
@@ -129,6 +130,8 @@ async function ensureVentasSchema() {
       actualizados INTEGER,
       creado_en    TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    -- Nueva columna del Excel de afectaciones: TipoCliente (no borra la tabla).
+    ALTER TABLE ventas ADD COLUMN IF NOT EXISTS tipo_cliente TEXT;
     -- Migración: la columna se llamaba tipo_venta; la fuente real es TipoCredito.
     DO $$ BEGIN
       IF EXISTS (SELECT 1 FROM information_schema.columns
@@ -162,6 +165,7 @@ function mapVentaRow(r) {
     toStr(pickCol(r, 'Vendedor', 'vendedor')),
     toStr(pickCol(r, 'TipoCredito', 'TipoVenta', 'tipo_credito')),
     toStr(pickCol(r, 'EstadoTipoProducto', 'estado_tipo_producto')),
+    toStr(pickCol(r, 'TipoCliente', 'tipo_cliente')),
     toInt(pickCol(r, 'DiaAF', 'dia_af')),
     toInt(pickCol(r, 'MesAF', 'mes_af')),
     toInt(pickCol(r, 'AñoAF', 'AnioAF', 'AnoAF', 'anio_af')),

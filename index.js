@@ -341,7 +341,7 @@ function mapVentaCallRow(r) {
 const REALZZA_COLS = [
   'codigo_cv', 'dia_cv', 'mes_cv', 'anio_cv', 'sede', 'monto_consolidado', 'cuota_inicial',
   'doc_identidad', 'productos', 'cuotas', 'estado_venta', 'asesor_venta', 'vendedor', 'entidad',
-  'tipo_base', 'dia_af', 'mes_af', 'anio_af',
+  'tipo_base', 'tipo_credito', 'tipo_producto', 'dia_af', 'mes_af', 'anio_af',
 ];
 function mapVentaRealzzaRow(r) {
   const codigo = toInt(pickCol(r, 'CodigoCV', 'codigo_cv', 'CODIGOCV', 'Codigo CV'));
@@ -362,6 +362,8 @@ function mapVentaRealzzaRow(r) {
     toStr(pickCol(r, 'VENDEDOR', 'Vendedor', 'vendedor')),   // ← identidad Realzza
     toStr(pickCol(r, 'ENTIDAD', 'Entidad', 'entidad')),
     toStr(pickCol(r, 'TipoBase', 'TIPO BASE', 'tipo_base')),
+    toStr(pickCol(r, 'TipoCredito', 'TipoVenta', 'TIPO CREDITO', 'tipo_credito')),
+    toStr(pickCol(r, 'TipoProducto', 'TIPO PRODUCTO', 'tipo_producto')),
     d, m, y,   // AF = fecha de venta (Realzza no tiene afectación separada en el Excel)
   ];
 }
@@ -403,6 +405,7 @@ const CANALES = {
         sede TEXT, monto_consolidado NUMERIC(14,2), cuota_inicial NUMERIC(14,2),
         doc_identidad TEXT, productos TEXT, cuotas INTEGER, estado_venta TEXT,
         asesor_venta TEXT, vendedor TEXT, entidad TEXT, tipo_base TEXT,
+        tipo_credito TEXT, tipo_producto TEXT,
         dia_af SMALLINT, mes_af SMALLINT, anio_af SMALLINT,
         fecha_cv DATE GENERATED ALWAYS AS (make_date(NULLIF(anio_cv,0),NULLIF(mes_cv,0),NULLIF(dia_cv,0))) STORED,
         fecha_af DATE GENERATED ALWAYS AS (make_date(NULLIF(anio_af,0),NULLIF(mes_af,0),NULLIF(dia_af,0))) STORED,
@@ -529,7 +532,7 @@ function registrarCanal(canal, ruta) {
 
       const sql = j
         ? `SELECT r.codigo_cv, r.dia_cv, r.mes_cv, r.anio_cv, r.sede, r.monto_consolidado, r.cuota_inicial,
-                  r.doc_identidad, r.productos, r.cuotas, r.asesor_venta, r.vendedor, r.entidad, r.tipo_base, r.fecha_cv,
+                  r.doc_identidad, r.productos, r.cuotas, r.asesor_venta, r.vendedor, r.entidad, r.tipo_base, r.tipo_credito, r.tipo_producto, r.fecha_cv,
                   COALESCE(v.estado_venta, r.estado_venta) AS estado_venta,
                   COALESCE(v.dia_af,  r.dia_af)  AS dia_af,
                   COALESCE(v.mes_af,  r.mes_af)  AS mes_af,

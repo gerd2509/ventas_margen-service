@@ -563,6 +563,154 @@ registrarCanal('call', 'ventas-call');
 registrarCanal('realzza', 'ventas-realzza');
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 🧲 LEADS KOMMO (Call / Realzza) — para la "maduración de leads"
+// Solo se usan para contar los LEADS INGRESADOS por mes (fecha de creación).
+// La maduración (meses lead→venta) se calcula aparte cruzando ventas con la
+// gestión KOMMO por DNI (en el frontend). Estas tablas guardan la data cruda.
+// ─────────────────────────────────────────────────────────────────────────────
+const LEADS_COLS = [
+  'id', 'nombre_lead', 'contacto_principal', 'responsable', 'embudo',
+  'dia_cr', 'mes_cr', 'anio_cr', 'ultima_modificacion', 'modificado_por', 'etiquetas',
+];
+// Parser tolerante para la "Fecha de creación" de Kommo (dd.mm.yyyy / dd/mm/yyyy,
+// con o sin hora). Devuelve {d, m, y}.
+function parseFechaDMY(v) {
+  if (v instanceof Date && !isNaN(v)) return { d: v.getDate(), m: v.getMonth() + 1, y: v.getFullYear() };
+  if (typeof v === 'number') {
+    const d = new Date(Math.round((v - 25569) * 86400 * 1000));
+    if (!isNaN(d)) return { d: d.getUTCDate(), m: d.getUTCMonth() + 1, y: d.getUTCFullYear() };
+  }
+  const s = String(v || '').trim();
+  if (!s) return { d: null, m: null, y: null };
+  const parte = s.split(/[ T]/)[0];
+  const p = parte.split(/[\/.\-]/).map(x => parseInt(x, 10));
+  if (p.length >= 3 && !p.some(isNaN)) {
+    if (p[0] > 31) return { y: p[0], m: p[1], d: p[2] };   // yyyy-mm-dd
+    return { d: p[0], m: p[1], y: p[2] };                   // dd/mm/yyyy
+  }
+  return { d: null, m: null, y: null };
+}
+function mapLeadRow(r) {
+  const id = toInt(pickCol(r, 'ID', 'Id', 'id'));
+  if (id === null) return null;
+  const f = parseFechaDMY(pickCol(r, 'Fecha de creación', 'Fecha de creacion', 'FECHA DE CREACIÓN', 'fecha_creacion'));
+  return [
+    id,
+    toStr(pickCol(r, 'Nombre del lead', 'nombre_lead')),
+    toStr(pickCol(r, 'Contacto principal', 'contacto_principal')),
+    toStr(pickCol(r, 'Responsable', 'responsable')),
+    toStr(pickCol(r, 'Embudo de ventas', 'embudo')),
+    f.d, f.m, f.y,
+    toStr(pickCol(r, 'Última modificación el', 'Ultima modificacion el', 'ultima_modificacion')),
+    toStr(pickCol(r, 'Modificado por', 'modificado_por')),
+    toStr(pickCol(r, 'Etiquetas del lead', 'etiquetas')),
+  ];
+}
+const leadsDdl = (t) => `
+  CREATE TABLE IF NOT EXISTS ${t} (
+    id            BIGINT PRIMARY KEY,
+    nombre_lead   TEXT, contacto_principal TEXT, responsable TEXT, embudo TEXT,
+    dia_cr SMALLINT, mes_cr SMALLINT, anio_cr SMALLINT,
+    ultima_modificacion TEXT, modificado_por TEXT, etiquetas TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+  CREATE INDEX IF NOT EXISTS ix_${t}_anio_mes ON ${t} (anio_cr, mes_cr);`;
+const LEADS = {
+  call:    { tabla: 'leads_kommo_call',    cargas: 'leads_kommo_call_cargas' },
+  realzza: { tabla: 'leads_kommo_realzza', cargas: 'leads_kommo_realzza_cargas' },
+};
+const leadsSet = LEADS_COLS.slice(1).map(c => `${c} = EXCLUDED.${c}`).join(', ') + ', updated_at = now()';
+const leadsSchemaLista = {};
+async function ensureLeadsSchema(canal) {
+  const c = LEADS[canal];
+  if (!pgPool || !c || leadsSchemaLista[canal]) return;
+  await pgPool.query(`
+    ${leadsDdl(c.tabla)}
+    CREATE TABLE IF NOT EXISTS ${c.cargas} (
+      id BIGSERIAL PRIMARY KEY, cargado_por TEXT, archivo TEXT, filas INTEGER,
+      insertados INTEGER, actualizados INTEGER, creado_en TIMESTAMPTZ NOT NULL DEFAULT now()
+    );`);
+  leadsSchemaLista[canal] = true;
+}
+async function upsertLeadsChunk(client, tabla, chunk) {
+  const params = [];
+  const tuples = chunk.map((row, i) => {
+    const base = i * LEADS_COLS.length; params.push(...row);
+    return '(' + LEADS_COLS.map((_, j) => `$${base + j + 1}`).join(',') + ')';
+  });
+  const sql = `INSERT INTO ${tabla} (${LEADS_COLS.join(',')}) VALUES ${tuples.join(',')}
+    ON CONFLICT (id) DO UPDATE SET ${leadsSet} RETURNING (xmax = 0) AS inserted`;
+  const { rows } = await client.query(sql, params);
+  let inserted = 0; for (const r of rows) if (r.inserted) inserted++;
+  return { inserted, updated: rows.length - inserted };
+}
+function registrarLeads(canal, ruta) {
+  const c = LEADS[canal];
+  app.post(`/${ruta}/import`, upload.single('archivo'), async (req, res) => {
+    if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+    if (!req.file) return res.status(400).json({ success: false, message: 'No se recibió archivo (campo "archivo").' });
+    try {
+      const wb = XLSX.read(req.file.buffer, { type: 'buffer' });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const raw = XLSX.utils.sheet_to_json(ws, { defval: '' });
+      const byId = new Map();
+      for (const r of raw) { const m = mapLeadRow(r); if (m) byId.set(m[0], m); }
+      const rows = Array.from(byId.values());
+      if (rows.length === 0) return res.status(400).json({ success: false, message: 'El archivo no tiene filas válidas (falta la columna ID).' });
+      await ensureLeadsSchema(canal);
+      const client = await pgPool.connect();
+      let insertados = 0, actualizados = 0;
+      try {
+        await client.query('BEGIN');
+        const CHUNK = 1000;
+        for (let i = 0; i < rows.length; i += CHUNK) {
+          const r = await upsertLeadsChunk(client, c.tabla, rows.slice(i, i + CHUNK));
+          insertados += r.inserted; actualizados += r.updated;
+        }
+        await client.query(`INSERT INTO ${c.cargas} (cargado_por, archivo, filas, insertados, actualizados) VALUES ($1,$2,$3,$4,$5)`,
+          [toStr(req.body && req.body.cargado_por), req.file.originalname || null, rows.length, insertados, actualizados]);
+        await client.query('COMMIT');
+      } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+      res.json({ success: true, filas: rows.length, insertados, actualizados, updated_at: new Date().toISOString() });
+    } catch (error) {
+      console.error(`❌ Error en POST /${ruta}/import:`, error);
+      res.status(500).json({ success: false, message: 'No se pudo importar el archivo.' });
+    }
+  });
+  app.get(`/${ruta}/estado`, async (req, res) => {
+    if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+    try {
+      await ensureLeadsSchema(canal);
+      const { rows } = await pgPool.query(`SELECT COUNT(*)::int AS total, MAX(updated_at) AS updated_at FROM ${c.tabla}`);
+      const { rows: cargas } = await pgPool.query(`SELECT cargado_por, archivo, filas, insertados, actualizados, creado_en FROM ${c.cargas} ORDER BY id DESC LIMIT 1`);
+      res.json({ success: true, total: rows[0].total, updated_at: rows[0].updated_at, ultimaCarga: cargas[0] || null });
+    } catch (error) {
+      console.error(`❌ Error en GET /${ruta}/estado:`, error);
+      res.status(500).json({ success: false, message: 'No se pudo obtener el estado.' });
+    }
+  });
+  // Conteo de leads por mes (para "Leads Ingresados"). Opcional ?anio=YYYY
+  app.get(`/${ruta}`, async (req, res) => {
+    if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+    try {
+      await ensureLeadsSchema(canal);
+      const params = []; let where = '';
+      if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); where = 'WHERE anio_cr = $1'; }
+      const { rows } = await pgPool.query(
+        `SELECT anio_cr AS anio, mes_cr AS mes, COUNT(*)::int AS total FROM ${c.tabla} ${where}
+         GROUP BY anio_cr, mes_cr ORDER BY anio_cr, mes_cr`, params);
+      res.json(rows);
+    } catch (error) {
+      console.error(`❌ Error en GET /${ruta}:`, error);
+      res.status(500).json({ success: false, message: 'No se pudieron obtener los leads.' });
+    }
+  });
+}
+registrarLeads('call', 'leads-kommo-call');
+registrarLeads('realzza', 'leads-kommo-realzza');
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 📊 MARGEN DE VENTAS (reemplazo por codigo_cv; uno-a-muchos por producto)
 // ─────────────────────────────────────────────────────────────────────────────
 const MARGEN_COLS = [

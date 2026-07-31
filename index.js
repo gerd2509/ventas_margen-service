@@ -14,6 +14,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const compression = require('compression');
 const multer = require('multer');
 const XLSX = require('xlsx');
 const { Pool } = require('pg');
@@ -21,6 +22,7 @@ const { Pool } = require('pg');
 const app = express();
 const PORT = process.env.PORT || 4003;
 
+app.use(compression());   // gzip: comprime las respuestas JSON (5-10× menos bytes)
 app.use(cors());
 app.use(express.json({ limit: '20mb' }));
 

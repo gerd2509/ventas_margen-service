@@ -690,11 +690,20 @@ function registrarLeads(canal, ruta) {
       res.status(500).json({ success: false, message: 'No se pudo obtener el estado.' });
     }
   });
-  // Conteo de leads por mes (para "Leads Ingresados"). Opcional ?anio=YYYY
+  // Conteo de leads ingresados (para "Leads Ingresados"). Opcional ?anio=YYYY.
+  // Con ?por=dia agrupa por día (para el gráfico de leads/día); si no, por mes.
   app.get(`/${ruta}`, async (req, res) => {
     if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
     try {
       await ensureLeadsSchema(canal);
+      if (req.query.por === 'dia') {
+        const params = []; let where = 'WHERE dia_cr IS NOT NULL AND mes_cr IS NOT NULL AND anio_cr IS NOT NULL';
+        if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); where += ` AND anio_cr = $${params.length}`; }
+        const { rows } = await pgPool.query(
+          `SELECT anio_cr AS anio, mes_cr AS mes, dia_cr AS dia, COUNT(*)::int AS total FROM ${c.tabla} ${where}
+           GROUP BY anio_cr, mes_cr, dia_cr ORDER BY anio_cr, mes_cr, dia_cr`, params);
+        return res.json(rows);
+      }
       const params = []; let where = '';
       if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); where = 'WHERE anio_cr = $1'; }
       const { rows } = await pgPool.query(

@@ -579,86 +579,190 @@ const ASESORES_CC = [
   ['CHANAME SOTO ANITA NOEMI', 'CC21'], ['BERNAL BAZAN FABRICIO ROLANDO', 'CC22'],
 ];
 const MAPA_SQL = `mapa(nombre, cc) AS (VALUES ${ASESORES_CC.map(([n, c]) => `('${n.replace(/'/g, "''")}','${c}')`).join(',')})`;
-// LATERAL que devuelve la última gestión de derivación (≤31 días) del DNI de la venta.
+// LATERAL que devuelve la última gestión de derivación (≤31 días) del DNI de la venta
+// (tabla `ventas` = afectaciones PB, alias v). Se cruza contra gestion_call.
 const DERIV_LATERAL = `
   LEFT JOIN LATERAL (
-    SELECT gc.asesor_contact, gc.marca_temporal FROM gestion_call gc
-    WHERE regexp_replace(gc.dni_cliente, '\\D', '', 'g') = regexp_replace(vc.doc_identidad, '\\D', '', 'g')
+    SELECT gc.asesor_contact, gc.marca_temporal, gc.tipo_cliente FROM gestion_call gc
+    WHERE regexp_replace(gc.dni_cliente, '\\D', '', 'g') = regexp_replace(v.doc_identidad, '\\D', '', 'g')
       AND gc.motivo_interes = ANY($1)
-      AND gc.marca_temporal::date <= vc.fecha_cv
-      AND vc.fecha_cv - gc.marca_temporal::date <= 31
+      AND gc.marca_temporal::date <= v.fecha_cv
+      AND v.fecha_cv - gc.marca_temporal::date <= 31
     ORDER BY gc.marca_temporal DESC LIMIT 1
   ) g ON true
   LEFT JOIN mapa m ON UPPER(TRIM(g.asesor_contact)) = m.nombre`;
 
-async function ensureAsesorManual() {
-  await pgPool.query(`ALTER TABLE ventas_call ADD COLUMN IF NOT EXISTS asesor_manual BOOLEAN NOT NULL DEFAULT false`);
+// Columnas de atribución sobre la tabla `ventas` (sin tocar `vendedor`/sede/tipo_cliente del import):
+//   asesor_venta       = CC del cruce/manual (AsesorVenta)
+//   atrib_contacto     = origen del contacto (lista: BD, MARKET PLACE, KOMMO, …) — editable
+//   atrib_tipo_cliente = tipo de cliente de la gestión (BRILLA, VIGENTE, …) — editable
+//   atrib_tipo_base    = por defecto = tipo_cliente — editable
+//   asesor_manual      = fila protegida del re-cruce (se editó a mano)
+async function ensureAtribVentas() {
+  await ensureVentasSchema();
+  await pgPool.query(`ALTER TABLE ventas ADD COLUMN IF NOT EXISTS asesor_venta       TEXT`);
+  await pgPool.query(`ALTER TABLE ventas ADD COLUMN IF NOT EXISTS atrib_contacto     TEXT`);
+  await pgPool.query(`ALTER TABLE ventas ADD COLUMN IF NOT EXISTS atrib_tipo_cliente TEXT`);
+  await pgPool.query(`ALTER TABLE ventas ADD COLUMN IF NOT EXISTS atrib_tipo_base    TEXT`);
+  await pgPool.query(`ALTER TABLE ventas ADD COLUMN IF NOT EXISTS asesor_manual      BOOLEAN NOT NULL DEFAULT false`);
 }
+// Columnas comunes que devuelven los endpoints de atribución (con las columnas del Excel Call).
+const ATRIB_SELECT = `
+  v.codigo_cv, v.doc_identidad, v.dia_cv, v.mes_cv, v.anio_cv,
+  v.monto_consolidado, v.cuota_inicial, v.cuotas, v.productos, v.sede,
+  v.cliente_venta AS cliente, v.tipo_credito AS tipo_venta, v.estado_venta, v.entidad,
+  v.asesor_venta AS vendedor, v.atrib_contacto AS contacto,
+  v.atrib_tipo_cliente AS tipo_cliente, v.atrib_tipo_base AS tipo_base, v.asesor_manual,
+  m.cc AS cc_sugerido, g.tipo_cliente AS tc_sugerido,
+  g.asesor_contact AS asesor_derivacion, g.marca_temporal::date AS fecha_gestion`;
 
-// POST /ventas-call/cruzar?anio=&mes= — atribuye el vendedor (CC) desde la derivación.
+// POST /ventas-call/cruzar?anio=&mes= — atribuye el AsesorVenta (CC) a las ventas
+// (tabla `ventas`) desde la última derivación en gestion_call. No pisa lo manual.
 app.post('/ventas-call/cruzar', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
-    await ensureCanalSchema('call');
-    await ensureAsesorManual();
-    const cond = ['NOT vc.asesor_manual']; const params = [DERIV_MOTIVOS];
-    if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`vc.anio_cv = $${params.length}`); }
-    if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`vc.mes_cv = $${params.length}`); }
+    await ensureAtribVentas();
+    const cond = ['NOT v.asesor_manual']; const params = [DERIV_MOTIVOS];
+    if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`v.anio_cv = $${params.length}`); }
+    if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`v.mes_cv = $${params.length}`); }
     const where = cond.join(' AND ');
     const { rows } = await pgPool.query(`
       WITH ${MAPA_SQL},
       deriv AS (
-        SELECT vc.codigo_cv, m.cc FROM ventas_call vc ${DERIV_LATERAL}
+        SELECT v.codigo_cv, m.cc, g.tipo_cliente AS tc FROM ventas v ${DERIV_LATERAL}
         WHERE ${where} AND m.cc IS NOT NULL
       )
-      UPDATE ventas_call vc SET vendedor = deriv.cc, updated_at = now()
-      FROM deriv WHERE vc.codigo_cv = deriv.codigo_cv AND vc.vendedor IS DISTINCT FROM deriv.cc
-      RETURNING vc.codigo_cv`, params);
-    // Cuántas quedaron sin atribución (sin derivación cruzada) en el mismo filtro.
-    const sinCond = ['NOT vc.asesor_manual']; const sinParams = [DERIV_MOTIVOS];
-    if (req.query.anio) { sinParams.push(parseInt(req.query.anio, 10)); sinCond.push(`vc.anio_cv = $${sinParams.length}`); }
-    if (req.query.mes)  { sinParams.push(parseInt(req.query.mes, 10));  sinCond.push(`vc.mes_cv = $${sinParams.length}`); }
-    const { rows: sin } = await pgPool.query(`
+      UPDATE ventas v SET
+        asesor_venta       = deriv.cc,
+        atrib_tipo_cliente = deriv.tc,
+        atrib_tipo_base    = deriv.tc,
+        updated_at = now()
+      FROM deriv WHERE v.codigo_cv = deriv.codigo_cv
+        AND (v.asesor_venta IS DISTINCT FROM deriv.cc OR v.atrib_tipo_cliente IS DISTINCT FROM deriv.tc)
+      RETURNING v.codigo_cv`, params);
+    // Total de ventas del mes con derivación cruzada (para mostrar el total atribuido).
+    const totCond = []; const totParams = [DERIV_MOTIVOS];
+    if (req.query.anio) { totParams.push(parseInt(req.query.anio, 10)); totCond.push(`v.anio_cv = $${totParams.length}`); }
+    if (req.query.mes)  { totParams.push(parseInt(req.query.mes, 10));  totCond.push(`v.mes_cv = $${totParams.length}`); }
+    const totWhere = totCond.length ? 'WHERE ' + totCond.join(' AND ') + ' AND m.cc IS NOT NULL' : 'WHERE m.cc IS NOT NULL';
+    const { rows: tot } = await pgPool.query(`
       WITH ${MAPA_SQL}
-      SELECT COUNT(*)::int n FROM ventas_call vc ${DERIV_LATERAL}
-      WHERE ${sinCond.join(' AND ')} AND m.cc IS NULL`, sinParams);
-    res.json({ success: true, actualizados: rows.length, sinDerivacion: sin[0].n });
+      SELECT COUNT(*)::int n FROM ventas v ${DERIV_LATERAL} ${totWhere}`, totParams);
+    res.json({ success: true, actualizados: rows.length, total: tot[0].n });
   } catch (e) { console.error('❌ POST /ventas-call/cruzar:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
-// GET /ventas-call/buscar?dni= — ventas Call de un DNI + la sugerencia de derivación.
+// GET /ventas-call/buscar?dni=&anio=&mes= — busca ese DNI en TODAS las afectaciones
+// (tabla `ventas`) del mes indicado + la sugerencia de derivación, para asignar a mano.
 app.get('/ventas-call/buscar', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
-    await ensureCanalSchema('call'); await ensureAsesorManual();
+    await ensureAtribVentas();
     const dni = String(req.query.dni || '').replace(/\D/g, '');
     if (!dni) return res.json([]);
+    const cond = [`regexp_replace(v.doc_identidad, '\\D', '', 'g') = $2`];
+    const params = [DERIV_MOTIVOS, dni];
+    if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`v.anio_cv = $${params.length}`); }
+    if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`v.mes_cv = $${params.length}`); }
     const { rows } = await pgPool.query(`
       WITH ${MAPA_SQL}
-      SELECT vc.codigo_cv, vc.doc_identidad, vc.dia_cv, vc.mes_cv, vc.anio_cv, vc.monto_consolidado,
-             vc.productos, vc.sede, vc.contacto, vc.tipo_base, vc.tipo_cliente, vc.estado_venta,
-             vc.vendedor, vc.asesor_manual,
-             m.cc AS cc_sugerido, g.asesor_contact AS asesor_derivacion, g.marca_temporal::date AS fecha_gestion
-      FROM ventas_call vc ${DERIV_LATERAL}
-      WHERE regexp_replace(vc.doc_identidad, '\\D', '', 'g') = $2
-      ORDER BY vc.fecha_cv DESC NULLS LAST`, [DERIV_MOTIVOS, dni]);
+      SELECT ${ATRIB_SELECT}
+      FROM ventas v ${DERIV_LATERAL}
+      WHERE ${cond.join(' AND ')}
+      ORDER BY v.fecha_cv DESC NULLS LAST`, params);
     res.json(rows);
   } catch (e) { console.error('❌ GET /ventas-call/buscar:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
-// PUT /ventas-call/:codigo — fija el vendedor (CC) a mano (protege del cruce).
+// GET /ventas-call/atribucion?anio=&mes= — ventas (tabla `ventas`) del mes que ESTÁN
+// atribuidas: con derivación en gestion_call o asignadas a mano. Para la lista.
+app.get('/ventas-call/atribucion', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAtribVentas();
+    const cond = ['(m.cc IS NOT NULL OR v.asesor_manual)']; const params = [DERIV_MOTIVOS];
+    if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`v.anio_cv = $${params.length}`); }
+    if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`v.mes_cv = $${params.length}`); }
+    const { rows } = await pgPool.query(`
+      WITH ${MAPA_SQL}
+      SELECT ${ATRIB_SELECT}
+      FROM ventas v ${DERIV_LATERAL}
+      WHERE ${cond.join(' AND ')}
+      ORDER BY v.fecha_cv DESC NULLS LAST, v.codigo_cv DESC`, params);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /ventas-call/atribucion:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// PUT /ventas-call/:codigo — edita a mano los campos de atribución (AsesorVenta,
+// CONTACTO, TipoCliente, TipoBase). Solo actualiza los que llegan en el body y
+// marca la fila como manual (protegida del re-cruce).
 app.put('/ventas-call/:codigo', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
-    await ensureCanalSchema('call'); await ensureAsesorManual();
-    const cc = String(req.body?.vendedor || '').trim().toUpperCase();
-    if (!cc) return res.status(400).json({ success: false, message: 'Falta el vendedor (CC).' });
+    await ensureAtribVentas();
+    const b = req.body || {};
+    const sets = []; const vals = [];
+    const add = (col, val, upper = false) => {
+      let s = String(val ?? '').trim(); if (upper) s = s.toUpperCase();
+      vals.push(s || null); sets.push(`${col} = $${vals.length}`);
+    };
+    if (b.vendedor     !== undefined) add('asesor_venta',       b.vendedor, true);
+    if (b.contacto     !== undefined) add('atrib_contacto',     b.contacto);
+    if (b.tipo_cliente !== undefined) add('atrib_tipo_cliente', b.tipo_cliente);
+    if (b.tipo_base    !== undefined) add('atrib_tipo_base',    b.tipo_base);
+    if (!sets.length) return res.status(400).json({ success: false, message: 'Nada para actualizar.' });
+    sets.push('asesor_manual = true', 'updated_at = now()');
+    vals.push(parseInt(req.params.codigo, 10));
     const { rowCount } = await pgPool.query(
-      `UPDATE ventas_call SET vendedor = $1, asesor_manual = true, updated_at = now() WHERE codigo_cv = $2`,
-      [cc, parseInt(req.params.codigo, 10)]);
+      `UPDATE ventas SET ${sets.join(', ')} WHERE codigo_cv = $${vals.length}`, vals);
     if (!rowCount) return res.status(404).json({ success: false, message: 'Venta no encontrada.' });
     res.json({ success: true });
   } catch (e) { console.error('❌ PUT /ventas-call/:codigo:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// POST /ventas-call/consolidar?anio=&mes= — copia (merge/upsert por IDVenta) las ventas
+// ATRIBUIDAS del mes desde `ventas` (afectaciones, data viva) hacia `ventas_call` (histórico
+// congelado que consume el módulo Ventas Call). Mapea asesor_venta→vendedor, atrib_*→contacto/
+// tipo_base/tipo_cliente. No borra: actualiza las que existen y agrega las nuevas.
+app.post('/ventas-call/consolidar', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAtribVentas();
+    await ensureCanalSchema('call');   // asegura la tabla ventas_call
+    const cond = ['(m.cc IS NOT NULL OR v.asesor_manual)']; const params = [DERIV_MOTIVOS];
+    if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`v.anio_cv = $${params.length}`); }
+    if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`v.mes_cv = $${params.length}`); }
+    // Columnas destino en ventas_call (codigo_cv es la clave; no se pisa en el UPDATE).
+    const cols = ['codigo_cv', 'dia_cv', 'mes_cv', 'anio_cv', 'sede', 'monto_consolidado', 'cuota_inicial',
+      'productos', 'cuotas', 'doc_identidad', 'tipo_credito', 'vendedor', 'estado_venta', 'dni_txt',
+      'contacto', 'tipo_base', 'tipo_cliente', 'entidad', 'dia_af', 'mes_af', 'anio_af', 'asesor_manual'];
+    // Se RESPETA lo que ya tiene ventas_call en estos campos (la data histórica manda):
+    // solo se llenan si están vacíos. Las filas nuevas (agosto en adelante, gestionadas
+    // desde el sistema) sí toman el valor del cruce al insertarse.
+    const preservar = new Set(['contacto', 'tipo_base', 'tipo_cliente']);
+    const setUpd = cols.filter(c => c !== 'codigo_cv').map(c =>
+      preservar.has(c)
+        ? `${c} = COALESCE(NULLIF(ventas_call.${c}, ''), EXCLUDED.${c})`
+        : `${c} = EXCLUDED.${c}`).join(', ');
+    const { rows } = await pgPool.query(`
+      WITH ${MAPA_SQL}
+      INSERT INTO ventas_call (${cols.join(', ')})
+      SELECT v.codigo_cv, v.dia_cv, v.mes_cv, v.anio_cv, v.sede, v.monto_consolidado, v.cuota_inicial,
+             v.productos, v.cuotas, v.doc_identidad, v.tipo_credito,
+             COALESCE(v.asesor_venta, m.cc)                 AS vendedor,
+             v.estado_venta, v.doc_identidad                AS dni_txt,
+             v.atrib_contacto                               AS contacto,
+             COALESCE(v.atrib_tipo_base, g.tipo_cliente)    AS tipo_base,
+             COALESCE(v.atrib_tipo_cliente, g.tipo_cliente) AS tipo_cliente,
+             v.entidad, v.dia_cv AS dia_af, v.mes_cv AS mes_af, v.anio_cv AS anio_af,
+             v.asesor_manual
+      FROM ventas v ${DERIV_LATERAL}
+      WHERE ${cond.join(' AND ')}
+      ON CONFLICT (codigo_cv) DO UPDATE SET ${setUpd}, updated_at = now()
+      RETURNING (xmax = 0) AS inserted`, params);
+    let insertados = 0; for (const r of rows) if (r.inserted) insertados++;
+    res.json({ success: true, total: rows.length, insertados, actualizados: rows.length - insertados });
+  } catch (e) { console.error('❌ POST /ventas-call/consolidar:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

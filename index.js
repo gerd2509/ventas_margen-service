@@ -565,6 +565,103 @@ registrarCanal('call', 'ventas-call');
 registrarCanal('realzza', 'ventas-realzza');
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 🎯 ATRIBUCIÓN DE VENTAS CALL (AsesorVenta) por la última gestión de DERIVACIÓN.
+// Reemplaza el VLOOKUP del Excel "GESTION CONTACT CENTER": cruza el DNI de la
+// venta con gestion_call, toma la ÚLTIMA gestión de derivación dentro de 31 días
+// y le pone el código CC del asesor. Lo que se edita a mano queda protegido
+// (asesor_manual=true) para que el cruce no lo pise.
+// ─────────────────────────────────────────────────────────────────────────────
+const DERIV_MOTIVOS = ['VENTA DERIVADA PARA CIERRE A SEDE', 'VISITARÁ TIENDA', 'SE ENVIÓ A ASESOR VISITA A DOMICILIO'];
+const ASESORES_CC = [
+  ['MORETO DELGADO PATRICIA ESTEFANY', 'CC1'], ['QUISPE FONSECA KAREN AIMEE', 'CC5'],
+  ['MORALES ÑIQUE MARIA CANDELARIA', 'CC6'], ['CHANTA CAMPOS KELLY KARINTIA', 'CC8'],
+  ['BERNAL BAZAN BRENDA NICOL', 'CC12'], ['TORRES ALVARADO JUDY ESMERALDA', 'CC15'],
+  ['CHANAME SOTO ANITA NOEMI', 'CC21'], ['BERNAL BAZAN FABRICIO ROLANDO', 'CC22'],
+];
+const MAPA_SQL = `mapa(nombre, cc) AS (VALUES ${ASESORES_CC.map(([n, c]) => `('${n.replace(/'/g, "''")}','${c}')`).join(',')})`;
+// LATERAL que devuelve la última gestión de derivación (≤31 días) del DNI de la venta.
+const DERIV_LATERAL = `
+  LEFT JOIN LATERAL (
+    SELECT gc.asesor_contact, gc.marca_temporal FROM gestion_call gc
+    WHERE regexp_replace(gc.dni_cliente, '\\D', '', 'g') = regexp_replace(vc.doc_identidad, '\\D', '', 'g')
+      AND gc.motivo_interes = ANY($1)
+      AND gc.marca_temporal::date <= vc.fecha_cv
+      AND vc.fecha_cv - gc.marca_temporal::date <= 31
+    ORDER BY gc.marca_temporal DESC LIMIT 1
+  ) g ON true
+  LEFT JOIN mapa m ON UPPER(TRIM(g.asesor_contact)) = m.nombre`;
+
+async function ensureAsesorManual() {
+  await pgPool.query(`ALTER TABLE ventas_call ADD COLUMN IF NOT EXISTS asesor_manual BOOLEAN NOT NULL DEFAULT false`);
+}
+
+// POST /ventas-call/cruzar?anio=&mes= — atribuye el vendedor (CC) desde la derivación.
+app.post('/ventas-call/cruzar', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCanalSchema('call');
+    await ensureAsesorManual();
+    const cond = ['NOT vc.asesor_manual']; const params = [DERIV_MOTIVOS];
+    if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`vc.anio_cv = $${params.length}`); }
+    if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`vc.mes_cv = $${params.length}`); }
+    const where = cond.join(' AND ');
+    const { rows } = await pgPool.query(`
+      WITH ${MAPA_SQL},
+      deriv AS (
+        SELECT vc.codigo_cv, m.cc FROM ventas_call vc ${DERIV_LATERAL}
+        WHERE ${where} AND m.cc IS NOT NULL
+      )
+      UPDATE ventas_call vc SET vendedor = deriv.cc, updated_at = now()
+      FROM deriv WHERE vc.codigo_cv = deriv.codigo_cv AND vc.vendedor IS DISTINCT FROM deriv.cc
+      RETURNING vc.codigo_cv`, params);
+    // Cuántas quedaron sin atribución (sin derivación cruzada) en el mismo filtro.
+    const sinCond = ['NOT vc.asesor_manual']; const sinParams = [DERIV_MOTIVOS];
+    if (req.query.anio) { sinParams.push(parseInt(req.query.anio, 10)); sinCond.push(`vc.anio_cv = $${sinParams.length}`); }
+    if (req.query.mes)  { sinParams.push(parseInt(req.query.mes, 10));  sinCond.push(`vc.mes_cv = $${sinParams.length}`); }
+    const { rows: sin } = await pgPool.query(`
+      WITH ${MAPA_SQL}
+      SELECT COUNT(*)::int n FROM ventas_call vc ${DERIV_LATERAL}
+      WHERE ${sinCond.join(' AND ')} AND m.cc IS NULL`, sinParams);
+    res.json({ success: true, actualizados: rows.length, sinDerivacion: sin[0].n });
+  } catch (e) { console.error('❌ POST /ventas-call/cruzar:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// GET /ventas-call/buscar?dni= — ventas Call de un DNI + la sugerencia de derivación.
+app.get('/ventas-call/buscar', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCanalSchema('call'); await ensureAsesorManual();
+    const dni = String(req.query.dni || '').replace(/\D/g, '');
+    if (!dni) return res.json([]);
+    const { rows } = await pgPool.query(`
+      WITH ${MAPA_SQL}
+      SELECT vc.codigo_cv, vc.doc_identidad, vc.dia_cv, vc.mes_cv, vc.anio_cv, vc.monto_consolidado,
+             vc.productos, vc.sede, vc.contacto, vc.tipo_base, vc.tipo_cliente, vc.estado_venta,
+             vc.vendedor, vc.asesor_manual,
+             m.cc AS cc_sugerido, g.asesor_contact AS asesor_derivacion, g.marca_temporal::date AS fecha_gestion
+      FROM ventas_call vc ${DERIV_LATERAL}
+      WHERE regexp_replace(vc.doc_identidad, '\\D', '', 'g') = $2
+      ORDER BY vc.fecha_cv DESC NULLS LAST`, [DERIV_MOTIVOS, dni]);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /ventas-call/buscar:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// PUT /ventas-call/:codigo — fija el vendedor (CC) a mano (protege del cruce).
+app.put('/ventas-call/:codigo', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureCanalSchema('call'); await ensureAsesorManual();
+    const cc = String(req.body?.vendedor || '').trim().toUpperCase();
+    if (!cc) return res.status(400).json({ success: false, message: 'Falta el vendedor (CC).' });
+    const { rowCount } = await pgPool.query(
+      `UPDATE ventas_call SET vendedor = $1, asesor_manual = true, updated_at = now() WHERE codigo_cv = $2`,
+      [cc, parseInt(req.params.codigo, 10)]);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'Venta no encontrada.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ PUT /ventas-call/:codigo:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 🧲 LEADS KOMMO (Call / Realzza) — para la "maduración de leads"
 // Solo se usan para contar los LEADS INGRESADOS por mes (fecha de creación).
 // La maduración (meses lead→venta) se calcula aparte cruzando ventas con la

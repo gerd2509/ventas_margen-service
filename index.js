@@ -1046,38 +1046,19 @@ async function ensureAtribSedes() {
   await pgPool.query(`ALTER TABLE ventas ADD COLUMN IF NOT EXISTS atrib_fuente_sede TEXT`);
   await pgPool.query(`ALTER TABLE ventas ADD COLUMN IF NOT EXISTS atrib_sede_manual BOOLEAN NOT NULL DEFAULT false`);
 }
-// Atribución de sedes: se lee la derivación EN VIVO del formulario (vía sheets-api), no de
-// la BD, así no hay que re-sincronizar nada. Se traen las respuestas y se pasan al cruce como
-// arrays (unnest). Match SOLO por DNI (no por fecha) — cuenta la derivación aunque se registre
-// después de la venta.
-const SHEETS_API_URL = (process.env.SHEETS_API_URL || 'https://api-leoncito.onrender.com').replace(/\/+$/, '');
-
-// Trae del formulario (en vivo) las derivaciones de la sede → arrays paralelos para el cruce.
-async function fetchDerivSede(sede) {
-  const norm = normSede(sede);
-  const resp = await fetch(`${SHEETS_API_URL}/gestion-sedes-deriv/live`, { signal: AbortSignal.timeout(90000) });
-  if (!resp.ok) throw new Error(`sheets-api /gestion-sedes-deriv/live -> ${resp.status}`);
-  const all = await resp.json();
-  const dnis = [], tbs = [], asesores = [], marcas = [];
-  for (const g of (Array.isArray(all) ? all : [])) {
-    if ((g.motivo_interes || '').toString().trim().toUpperCase() !== MOTIVO_DERIV_SEDE) continue;
-    if (normSede(g.sede) !== norm) continue;
-    dnis.push(String(g.dni_cliente || ''));
-    tbs.push(String(g.tipo_base || ''));
-    asesores.push(String(g.asesor || ''));
-    marcas.push(g.marca_temporal || null);
-  }
-  return { dnis, tbs, asesores, marcas };
-}
-
-// LATERAL: derivación del DNI en esa sede, sobre las respuestas del formulario en vivo.
-// $1 = DNIs[], $2 = tipos_base[], $3 = asesores[], $4 = marcas_temporales[] (ya filtrados por sede/motivo en JS).
+// LATERAL: derivación (tabla gestion_sedes_deriv) del DNI en esa sede. El espejo se
+// llena con POST /gestion-sedes-deriv/sync (botón "Sincronizar formulario" en la UI).
+// Match SOLO por DNI (no por fecha) — cuenta la derivación aunque se registre después de
+// la venta. $1 = motivo, $2 = sede (upper, con acento).
 const DERIV_LATERAL_SEDE = `
   LEFT JOIN LATERAL (
-    SELECT d.tipo_base, d.marca_temporal, d.asesor
-    FROM unnest($1::text[], $2::text[], $3::text[], $4::timestamptz[]) AS d(dni, tipo_base, asesor, marca_temporal)
-    WHERE regexp_replace(d.dni, '\\D', '', 'g') = regexp_replace(v.doc_identidad, '\\D', '', 'g')
-    ORDER BY d.marca_temporal DESC NULLS LAST LIMIT 1
+    SELECT gsd.tipo_base, gsd.marca_temporal,
+           COALESCE(NULLIF(gsd.asesor_lambayeque, ''), gsd.asesor_ferrenafe) AS asesor
+    FROM gestion_sedes_deriv gsd
+    WHERE regexp_replace(gsd.dni_cliente, '\\D', '', 'g') = regexp_replace(v.doc_identidad, '\\D', '', 'g')
+      AND gsd.motivo_interes = $1
+      AND upper(trim(gsd.sede)) = $2
+    ORDER BY gsd.marca_temporal DESC LIMIT 1
   ) g ON true`;
 const ATRIB_SELECT_SEDE = `
   v.codigo_cv, v.dia_cv, v.mes_cv, v.anio_cv, v.sede, v.monto_consolidado, v.cuota_inicial,
@@ -1095,10 +1076,9 @@ app.post('/ventas-sedes/cruzar', async (req, res) => {
     await ensureAtribSedes();
     const sede = normSede(req.query.sede);
     if (!sede) return res.status(400).json({ success: false, message: 'Falta la sede.' });
-    const { dnis, tbs, asesores, marcas } = await fetchDerivSede(sede);
     const cond = ['NOT COALESCE(v.atrib_sede_manual, false)', "(v.atrib_fuente_sede IS NULL OR v.atrib_fuente_sede = '')",
-      `v.sede ILIKE '%' || $5 || '%'`];
-    const params = [dnis, tbs, asesores, marcas, sede];
+      `v.sede ILIKE '%' || $2 || '%'`];
+    const params = [MOTIVO_DERIV_SEDE, sede];
     if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`v.anio_cv = $${params.length}`); }
     if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`v.mes_cv = $${params.length}`); }
     const { rows } = await pgPool.query(`
@@ -1117,14 +1097,13 @@ app.post('/ventas-sedes/cruzar', async (req, res) => {
 app.get('/ventas-sedes/atribucion', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
-    // La atribución se cruza EN VIVO con el formulario: nunca servir cacheado (navegador/proxy).
+    // Cruce dinámico contra el espejo del formulario: nunca servir cacheado (navegador/proxy).
     res.set('Cache-Control', 'no-store');
     await ensureAtribSedes();
     const sede = normSede(req.query.sede);
     if (!sede) return res.status(400).json({ success: false, message: 'Falta la sede.' });
-    const { dnis, tbs, asesores, marcas } = await fetchDerivSede(sede);
-    const cond = [`v.sede ILIKE '%' || $5 || '%'`, 'v.monto_consolidado > 0'];
-    const params = [dnis, tbs, asesores, marcas, sede];
+    const cond = [`v.sede ILIKE '%' || $2 || '%'`, 'v.monto_consolidado > 0'];
+    const params = [MOTIVO_DERIV_SEDE, sede];
     if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`v.anio_cv = $${params.length}`); }
     if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`v.mes_cv = $${params.length}`); }
     const { rows } = await pgPool.query(`
@@ -1144,9 +1123,8 @@ app.get('/ventas-sedes/buscar', async (req, res) => {
     const sede = normSede(req.query.sede);
     const dni = String(req.query.dni || '').replace(/\D/g, '');
     if (!sede || !dni) return res.json([]);
-    const { dnis, tbs, asesores, marcas } = await fetchDerivSede(sede);
-    const cond = [`v.sede ILIKE '%' || $5 || '%'`, `regexp_replace(v.doc_identidad, '\\D', '', 'g') = $6`];
-    const params = [dnis, tbs, asesores, marcas, sede, dni];
+    const cond = [`v.sede ILIKE '%' || $2 || '%'`, `regexp_replace(v.doc_identidad, '\\D', '', 'g') = $3`];
+    const params = [MOTIVO_DERIV_SEDE, sede, dni];
     if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`v.anio_cv = $${params.length}`); }
     if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`v.mes_cv = $${params.length}`); }
     const { rows } = await pgPool.query(`

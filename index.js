@@ -1030,6 +1030,123 @@ app.post('/ventas-realzza/consolidar', async (req, res) => {
   } catch (e) { console.error('❌ POST /ventas-realzza/consolidar:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 🏬 ATRIBUCIÓN DE SEDES (Lambayeque / Ferreñafe) — cruza `ventas` × gestion_sedes_deriv
+// La "fuente generadora" = TIPO DE BASE de la derivación. Se guarda en ventas.atrib_fuente_sede
+// (Ventas Sedes lee `ventas` directo, no hay tabla consolidada). Solo ago-2026+ para la tabla.
+// ─────────────────────────────────────────────────────────────────────────────
+const MOTIVO_DERIV_SEDE = 'VENTA DERIVADA PARA CIERRE A SEDE';
+function normSede(s) {
+  const u = (s || '').toString().trim().toUpperCase();
+  if (u.includes('FERRE')) return 'FERREÑAFE';
+  if (u.includes('LAMBAYEQUE')) return 'LAMBAYEQUE';
+  return u;
+}
+async function ensureAtribSedes() {
+  await pgPool.query(`ALTER TABLE ventas ADD COLUMN IF NOT EXISTS atrib_fuente_sede TEXT`);
+  await pgPool.query(`ALTER TABLE ventas ADD COLUMN IF NOT EXISTS atrib_sede_manual BOOLEAN NOT NULL DEFAULT false`);
+}
+// LATERAL: derivación (gestion_sedes_deriv) del DNI en esa sede. Para SEDES el match es
+// SOLO por DNI (no por fecha), a diferencia de Call/Realzza — así cuenta la derivación
+// aunque se haya registrado después de la venta. $1 = motivo, $2 = sede (upper, con acento).
+const DERIV_LATERAL_SEDE = `
+  LEFT JOIN LATERAL (
+    SELECT gsd.tipo_base, gsd.marca_temporal,
+           COALESCE(NULLIF(gsd.asesor_lambayeque, ''), gsd.asesor_ferrenafe) AS asesor
+    FROM gestion_sedes_deriv gsd
+    WHERE regexp_replace(gsd.dni_cliente, '\\D', '', 'g') = regexp_replace(v.doc_identidad, '\\D', '', 'g')
+      AND gsd.motivo_interes = $1
+      AND upper(trim(gsd.sede)) = $2
+    ORDER BY gsd.marca_temporal DESC LIMIT 1
+  ) g ON true`;
+const ATRIB_SELECT_SEDE = `
+  v.codigo_cv, v.dia_cv, v.mes_cv, v.anio_cv, v.sede, v.monto_consolidado, v.cuota_inicial,
+  v.doc_identidad, v.productos, v.cuotas, v.estado_venta, v.vendedor, v.entidad, v.tipo_credito,
+  v.cliente_venta AS cliente, v.dia_af, v.mes_af, v.anio_af,
+  COALESCE(NULLIF(v.atrib_fuente_sede, ''), g.tipo_base) AS fuente,
+  COALESCE(v.atrib_sede_manual, false)                   AS manual,
+  (g.marca_temporal IS NOT NULL)                         AS derivado,
+  g.tipo_base AS fuente_sugerida, g.asesor AS asesor_derivacion, g.marca_temporal::date AS fecha_gestion`;
+
+// POST /ventas-sedes/cruzar?anio=&mes=&sede= — llena atrib_fuente_sede VACÍO desde la derivación.
+app.post('/ventas-sedes/cruzar', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAtribSedes();
+    const sede = normSede(req.query.sede);
+    if (!sede) return res.status(400).json({ success: false, message: 'Falta la sede.' });
+    const cond = ['NOT COALESCE(v.atrib_sede_manual, false)', "(v.atrib_fuente_sede IS NULL OR v.atrib_fuente_sede = '')",
+      `v.sede ILIKE '%' || $2 || '%'`];
+    const params = [MOTIVO_DERIV_SEDE, sede];
+    if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`v.anio_cv = $${params.length}`); }
+    if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`v.mes_cv = $${params.length}`); }
+    const { rows } = await pgPool.query(`
+      WITH deriv AS (
+        SELECT v.codigo_cv, g.tipo_base AS tb FROM ventas v ${DERIV_LATERAL_SEDE}
+        WHERE ${cond.join(' AND ')} AND g.tipo_base IS NOT NULL AND g.tipo_base <> ''
+      )
+      UPDATE ventas v SET atrib_fuente_sede = deriv.tb, updated_at = now()
+      FROM deriv WHERE v.codigo_cv = deriv.codigo_cv
+      RETURNING v.codigo_cv`, params);
+    res.json({ success: true, actualizados: rows.length });
+  } catch (e) { console.error('❌ POST /ventas-sedes/cruzar:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// GET /ventas-sedes/atribucion?anio=&mes=&sede= — ventas de la sede con su fuente + derivado.
+app.get('/ventas-sedes/atribucion', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAtribSedes();
+    const sede = normSede(req.query.sede);
+    if (!sede) return res.status(400).json({ success: false, message: 'Falta la sede.' });
+    const cond = [`v.sede ILIKE '%' || $2 || '%'`, 'v.monto_consolidado > 0'];
+    const params = [MOTIVO_DERIV_SEDE, sede];
+    if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`v.anio_cv = $${params.length}`); }
+    if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`v.mes_cv = $${params.length}`); }
+    const { rows } = await pgPool.query(`
+      SELECT ${ATRIB_SELECT_SEDE} FROM ventas v ${DERIV_LATERAL_SEDE}
+      WHERE ${cond.join(' AND ')}
+      ORDER BY v.fecha_cv DESC NULLS LAST, v.codigo_cv DESC`, params);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /ventas-sedes/atribucion:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// GET /ventas-sedes/buscar?dni=&anio=&mes=&sede= — busca ese DNI en las ventas de la sede.
+app.get('/ventas-sedes/buscar', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAtribSedes();
+    const sede = normSede(req.query.sede);
+    const dni = String(req.query.dni || '').replace(/\D/g, '');
+    if (!sede || !dni) return res.json([]);
+    const cond = [`v.sede ILIKE '%' || $2 || '%'`, `regexp_replace(v.doc_identidad, '\\D', '', 'g') = $3`];
+    const params = [MOTIVO_DERIV_SEDE, sede, dni];
+    if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`v.anio_cv = $${params.length}`); }
+    if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`v.mes_cv = $${params.length}`); }
+    const { rows } = await pgPool.query(`
+      SELECT ${ATRIB_SELECT_SEDE} FROM ventas v ${DERIV_LATERAL_SEDE}
+      WHERE ${cond.join(' AND ')}
+      ORDER BY v.fecha_cv DESC NULLS LAST`, params);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /ventas-sedes/buscar:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// PUT /ventas-sedes/:codigo — edita a mano la fuente generadora (protege del re-cruce).
+app.put('/ventas-sedes/:codigo', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAtribSedes();
+    const b = req.body || {};
+    if (b.fuente === undefined) return res.status(400).json({ success: false, message: 'Nada para actualizar.' });
+    const fuente = String(b.fuente ?? '').trim().toUpperCase() || null;
+    const { rowCount } = await pgPool.query(
+      'UPDATE ventas SET atrib_fuente_sede = $2, atrib_sede_manual = true, updated_at = now() WHERE codigo_cv = $1',
+      [parseInt(req.params.codigo, 10), fuente]);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'Venta no encontrada.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ PUT /ventas-sedes/:codigo:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
 // GET /ventas-realzza/modulo?anio= — data del MÓDULO Ventas Realzza: UNA fila por venta,
 // base en `ventas` (afectaciones PB, COMPLETO para todos los meses) y cruzando con
 // `ventas_realzza` (atribución) solo para el TipoBase / TipoProducto. Así:

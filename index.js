@@ -1117,6 +1117,8 @@ app.post('/ventas-sedes/cruzar', async (req, res) => {
 app.get('/ventas-sedes/atribucion', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
+    // La atribución se cruza EN VIVO con el formulario: nunca servir cacheado (navegador/proxy).
+    res.set('Cache-Control', 'no-store');
     await ensureAtribSedes();
     const sede = normSede(req.query.sede);
     if (!sede) return res.status(400).json({ success: false, message: 'Falta la sede.' });
@@ -1138,6 +1140,7 @@ app.get('/ventas-sedes/buscar', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureAtribSedes();
+    res.set('Cache-Control', 'no-store');
     const sede = normSede(req.query.sede);
     const dni = String(req.query.dni || '').replace(/\D/g, '');
     if (!sede || !dni) return res.json([]);

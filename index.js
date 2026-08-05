@@ -293,6 +293,56 @@ app.get('/ventas', async (req, res) => {
   }
 });
 
+// GET /ventas/evolutivo — neto REAL mensual por SEDE (todos los meses/años) para el gráfico
+// evolutivo de Ventas Sedes: ventas (por mes CV) − NC no refacturadas (por mes AF) −
+// incautaciones (por mes AF). Devuelve [{sede, anio, mes, ventas, nc, inc, neto}].
+app.get('/ventas/evolutivo', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureVentasSchema();
+    const { rows } = await pgPool.query(`
+      WITH ven AS (
+        SELECT sede, anio_cv AS anio, mes_cv AS mes, SUM(monto_consolidado) AS monto FROM ventas
+        WHERE UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%'
+          AND monto_consolidado > 0 AND anio_cv IS NOT NULL AND mes_cv IS NOT NULL
+        GROUP BY sede, anio_cv, mes_cv
+      ),
+      ncnr AS (
+        SELECT n.sede, n.anio_af AS anio, n.mes_af AS mes, SUM(n.monto_consolidado) AS monto FROM ventas n
+        WHERE UPPER(COALESCE(n.estado_venta,'')) LIKE '%NOTA DE%' AND n.anio_af IS NOT NULL AND n.mes_af IS NOT NULL
+          AND NOT (n.anio_cv = n.anio_af AND n.mes_cv = n.mes_af AND EXISTS (
+            SELECT 1 FROM ventas v2 WHERE UPPER(COALESCE(v2.estado_venta,'')) NOT LIKE '%NOTA DE%'
+              AND UPPER(COALESCE(v2.estado_venta,'')) NOT LIKE '%INCAUTAC%'
+              AND v2.codigo_cv <> n.codigo_cv AND v2.sede = n.sede
+              AND regexp_replace(v2.doc_identidad,'\\D','','g') = regexp_replace(n.doc_identidad,'\\D','','g')
+              AND v2.anio_cv = n.anio_cv AND v2.mes_cv = n.mes_cv AND v2.fecha_cv >= n.fecha_cv))
+        GROUP BY n.sede, n.anio_af, n.mes_af
+      ),
+      inc AS (
+        SELECT sede, anio_af AS anio, mes_af AS mes, SUM(monto_consolidado) AS monto FROM ventas
+        WHERE UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%' AND anio_af IS NOT NULL AND mes_af IS NOT NULL
+        GROUP BY sede, anio_af, mes_af
+      ),
+      claves AS (
+        SELECT sede, anio, mes FROM ven
+        UNION SELECT sede, anio, mes FROM ncnr
+        UNION SELECT sede, anio, mes FROM inc
+      )
+      SELECT k.sede, k.anio, k.mes,
+        ROUND(COALESCE(ven.monto,0))::int  AS ventas,
+        ROUND(COALESCE(ncnr.monto,0))::int AS nc,
+        ROUND(COALESCE(inc.monto,0))::int  AS inc,
+        ROUND(COALESCE(ven.monto,0) - COALESCE(ncnr.monto,0) - COALESCE(inc.monto,0))::int AS neto
+      FROM claves k
+      LEFT JOIN ven  ON ven.sede  = k.sede AND ven.anio  = k.anio AND ven.mes  = k.mes
+      LEFT JOIN ncnr ON ncnr.sede = k.sede AND ncnr.anio = k.anio AND ncnr.mes = k.mes
+      LEFT JOIN inc  ON inc.sede  = k.sede AND inc.anio  = k.anio AND inc.mes  = k.mes
+      WHERE k.anio > 0 AND k.mes > 0
+      ORDER BY k.anio, k.mes`);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /ventas/evolutivo:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 🏷️  VENTAS POR CANAL — Call y Realzza (evolutivo propio, tablas separadas)
 // Cada canal tiene su tabla, su carga y su ESQUEMA propio (los Excel difieren):
@@ -439,6 +489,12 @@ async function ensureCanalSchema(canal) {
       creado_en    TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  // Tablas creadas antes de que existiera la columna: la agrega sin recrear la tabla.
+  await pgPool.query(`ALTER TABLE ${c.tabla} ADD COLUMN IF NOT EXISTS tipo_producto TEXT`);
+  // Marca de venta "sin derivación" (ago-2026+): suma al global pero NO al asesor.
+  await pgPool.query(`ALTER TABLE ${c.tabla} ADD COLUMN IF NOT EXISTS sin_derivacion BOOLEAN NOT NULL DEFAULT false`);
+  // Marca manual "extranjero": una venta sin derivación marcada SÍ cuenta al vendedor.
+  await pgPool.query(`ALTER TABLE ${c.tabla} ADD COLUMN IF NOT EXISTS extranjero BOOLEAN NOT NULL DEFAULT false`);
   canalSchemaLista[canal] = true;
 }
 
@@ -538,7 +594,7 @@ function registrarCanal(canal, ruta) {
 
       const sql = j
         ? `SELECT r.codigo_cv, r.dia_cv, r.mes_cv, r.anio_cv, r.sede, r.monto_consolidado, r.cuota_inicial,
-                  r.doc_identidad, r.productos, r.cuotas, r.asesor_venta, r.vendedor, r.entidad, r.tipo_base, r.tipo_credito, r.tipo_producto, r.fecha_cv,
+                  r.doc_identidad, r.productos, r.cuotas, r.asesor_venta, r.vendedor, r.entidad, r.tipo_base, r.tipo_credito, r.tipo_producto, r.sin_derivacion, r.extranjero, r.fecha_cv,
                   COALESCE(v.estado_venta, r.estado_venta) AS estado_venta,
                   COALESCE(v.dia_af,  r.dia_af)  AS dia_af,
                   COALESCE(v.mes_af,  r.mes_af)  AS mes_af,
@@ -572,11 +628,16 @@ registrarCanal('realzza', 'ventas-realzza');
 // (asesor_manual=true) para que el cruce no lo pise.
 // ─────────────────────────────────────────────────────────────────────────────
 const DERIV_MOTIVOS = ['VENTA DERIVADA PARA CIERRE A SEDE', 'VISITARÁ TIENDA', 'SE ENVIÓ A ASESOR VISITA A DOMICILIO'];
+// Mapa nombre del asesor Call → código CC (fuente: lista de asesores del dashboard).
+// Debe incluir a TODOS los asesores Call; si falta uno, sus derivaciones no se atribuyen.
 const ASESORES_CC = [
-  ['MORETO DELGADO PATRICIA ESTEFANY', 'CC1'], ['QUISPE FONSECA KAREN AIMEE', 'CC5'],
-  ['MORALES ÑIQUE MARIA CANDELARIA', 'CC6'], ['CHANTA CAMPOS KELLY KARINTIA', 'CC8'],
-  ['BERNAL BAZAN BRENDA NICOL', 'CC12'], ['TORRES ALVARADO JUDY ESMERALDA', 'CC15'],
-  ['CHANAME SOTO ANITA NOEMI', 'CC21'], ['BERNAL BAZAN FABRICIO ROLANDO', 'CC22'],
+  ['MORETO DELGADO PATRICIA ESTEFANY', 'CC1'], ['UCHOFEN VIGO FELICITA', 'CC3'],
+  ['QUISPE FONSECA KAREN AIMEE', 'CC5'], ['MORALES ÑIQUE MARIA CANDELARIA', 'CC6'],
+  ['CHANTA CAMPOS KELLY KARINTIA', 'CC8'], ['SAMAME HUAMAN ARIADNE', 'CC11'],
+  ['BERNAL BAZAN BRENDA NICOL', 'CC12'], ['CARBONEL GUERRERO FRANCIS JHON', 'CC13'],
+  ['TORRES ALVARADO JUDY ESMERALDA', 'CC15'], ['BONILLA CHUMACERO VILMA ROSSMERY', 'CC16'],
+  ['SANDOVAL OTINIANO JUANA DEL PILAR', 'CC19'], ['CHANAME SOTO ANITA NOEMI', 'CC21'],
+  ['BERNAL BAZAN FABRICIO ROLANDO', 'CC22'], ['RUIZ SAMPEN LUCRECIA NOEMI', 'CC26'],
 ];
 const MAPA_SQL = `mapa(nombre, cc) AS (VALUES ${ASESORES_CC.map(([n, c]) => `('${n.replace(/'/g, "''")}','${c}')`).join(',')})`;
 // LATERAL que devuelve la última gestión de derivación (≤31 días) del DNI de la venta
@@ -605,14 +666,26 @@ async function ensureAtribVentas() {
   await pgPool.query(`ALTER TABLE ventas ADD COLUMN IF NOT EXISTS atrib_tipo_cliente TEXT`);
   await pgPool.query(`ALTER TABLE ventas ADD COLUMN IF NOT EXISTS atrib_tipo_base    TEXT`);
   await pgPool.query(`ALTER TABLE ventas ADD COLUMN IF NOT EXISTS asesor_manual      BOOLEAN NOT NULL DEFAULT false`);
+  // Marca manual "extranjero" (carnet de extranjería): la venta nunca cruza por DNI,
+  // pero al marcarla sí cuenta al avance del vendedor aunque sea sin derivación.
+  await pgPool.query(`ALTER TABLE ventas ADD COLUMN IF NOT EXISTS atrib_extranjero   BOOLEAN NOT NULL DEFAULT false`);
 }
 // Columnas comunes que devuelven los endpoints de atribución (con las columnas del Excel Call).
+// Los campos atribuidos muestran el valor EFECTIVO: lo guardado (o editado a mano)
+// y, si aún no se cruzó, la sugerencia de la derivación (el CC y el TipoCliente que
+// la gestión ya conoce). TipoBase = TipoCliente por defecto. `consolidar` usa el
+// mismo COALESCE, así lista y consolidación coinciden.
 const ATRIB_SELECT = `
   v.codigo_cv, v.doc_identidad, v.dia_cv, v.mes_cv, v.anio_cv,
   v.monto_consolidado, v.cuota_inicial, v.cuotas, v.productos, v.sede,
   v.cliente_venta AS cliente, v.tipo_credito AS tipo_venta, v.estado_venta, v.entidad,
-  v.asesor_venta AS vendedor, v.atrib_contacto AS contacto,
-  v.atrib_tipo_cliente AS tipo_cliente, v.atrib_tipo_base AS tipo_base, v.asesor_manual,
+  COALESCE(v.asesor_venta, m.cc)                                 AS vendedor,
+  v.atrib_contacto                                              AS contacto,
+  COALESCE(v.atrib_tipo_cliente, g.tipo_cliente)                AS tipo_cliente,
+  COALESCE(v.atrib_tipo_base, v.atrib_tipo_cliente, g.tipo_cliente) AS tipo_base,
+  v.asesor_manual,
+  (g.marca_temporal IS NULL AND (v.anio_cv > 2026 OR (v.anio_cv = 2026 AND v.mes_cv >= 8))) AS sin_derivacion,
+  COALESCE(v.atrib_extranjero, false) AS extranjero,
   m.cc AS cc_sugerido, g.tipo_cliente AS tc_sugerido,
   g.asesor_contact AS asesor_derivacion, g.marca_temporal::date AS fecha_gestion`;
 
@@ -710,6 +783,7 @@ app.put('/ventas-call/:codigo', async (req, res) => {
     if (b.contacto     !== undefined) add('atrib_contacto',     b.contacto);
     if (b.tipo_cliente !== undefined) add('atrib_tipo_cliente', b.tipo_cliente);
     if (b.tipo_base    !== undefined) add('atrib_tipo_base',    b.tipo_base);
+    if (b.extranjero   !== undefined) { vals.push(!!b.extranjero); sets.push(`atrib_extranjero = $${vals.length}`); }
     if (!sets.length) return res.status(400).json({ success: false, message: 'Nada para actualizar.' });
     sets.push('asesor_manual = true', 'updated_at = now()');
     vals.push(parseInt(req.params.codigo, 10));
@@ -735,15 +809,21 @@ app.post('/ventas-call/consolidar', async (req, res) => {
     // Columnas destino en ventas_call (codigo_cv es la clave; no se pisa en el UPDATE).
     const cols = ['codigo_cv', 'dia_cv', 'mes_cv', 'anio_cv', 'sede', 'monto_consolidado', 'cuota_inicial',
       'productos', 'cuotas', 'doc_identidad', 'tipo_credito', 'vendedor', 'estado_venta', 'dni_txt',
-      'contacto', 'tipo_base', 'tipo_cliente', 'entidad', 'dia_af', 'mes_af', 'anio_af', 'asesor_manual'];
+      'contacto', 'tipo_base', 'tipo_cliente', 'entidad', 'tipo_producto', 'dia_af', 'mes_af', 'anio_af',
+      'asesor_manual', 'sin_derivacion', 'extranjero'];
     // Se RESPETA lo que ya tiene ventas_call en estos campos (la data histórica manda):
     // solo se llenan si están vacíos. Las filas nuevas (agosto en adelante, gestionadas
     // desde el sistema) sí toman el valor del cruce al insertarse.
     const preservar = new Set(['contacto', 'tipo_base', 'tipo_cliente']);
+    // sin_derivacion se CONGELA en la 1ª consolidación (el estado original manda: la
+    // edición manual no crea derivación, así que no debe cambiarlo al re-consolidar).
+    const mantener = new Set(['sin_derivacion']);
     const setUpd = cols.filter(c => c !== 'codigo_cv').map(c =>
-      preservar.has(c)
-        ? `${c} = COALESCE(NULLIF(ventas_call.${c}, ''), EXCLUDED.${c})`
-        : `${c} = EXCLUDED.${c}`).join(', ');
+      mantener.has(c)
+        ? `${c} = ventas_call.${c}`
+        : preservar.has(c)
+          ? `${c} = COALESCE(NULLIF(ventas_call.${c}, ''), EXCLUDED.${c})`
+          : `${c} = EXCLUDED.${c}`).join(', ');
     const { rows } = await pgPool.query(`
       WITH ${MAPA_SQL}
       INSERT INTO ventas_call (${cols.join(', ')})
@@ -754,8 +834,11 @@ app.post('/ventas-call/consolidar', async (req, res) => {
              v.atrib_contacto                               AS contacto,
              COALESCE(v.atrib_tipo_base, g.tipo_cliente)    AS tipo_base,
              COALESCE(v.atrib_tipo_cliente, g.tipo_cliente) AS tipo_cliente,
-             v.entidad, v.dia_cv AS dia_af, v.mes_cv AS mes_af, v.anio_cv AS anio_af,
-             v.asesor_manual
+             v.entidad, v.estado_tipo_producto AS tipo_producto,
+             v.dia_cv AS dia_af, v.mes_cv AS mes_af, v.anio_cv AS anio_af,
+             v.asesor_manual,
+             (g.marca_temporal IS NULL AND (v.anio_cv > 2026 OR (v.anio_cv = 2026 AND v.mes_cv >= 8))) AS sin_derivacion,
+             COALESCE(v.atrib_extranjero, false) AS extranjero
       FROM ventas v ${DERIV_LATERAL}
       WHERE ${cond.join(' AND ')}
       ON CONFLICT (codigo_cv) DO UPDATE SET ${setUpd}, updated_at = now()
@@ -763,6 +846,280 @@ app.post('/ventas-call/consolidar', async (req, res) => {
     let insertados = 0; for (const r of rows) if (r.inserted) insertados++;
     res.json({ success: true, total: rows.length, insertados, actualizados: rows.length - insertados });
   } catch (e) { console.error('❌ POST /ventas-call/consolidar:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🎯 ATRIBUCIÓN DE VENTAS REALZZA (TipoBase) por la última gestión de DERIVACIÓN.
+// Análogo a Call pero sobre `ventas_realzza` × `gestion_realzza`: la última gestión
+// de derivación (≤31 días) aporta el TipoBase. Se RESPETA el tipo_base del import:
+// el cruce solo llena los vacíos; lo editado a mano queda protegido (asesor_manual).
+// MargenTotal / ValorVenta / ClienteVenta salen de margen_ventas por CodigoCV.
+// ─────────────────────────────────────────────────────────────────────────────
+const DERIV_MOTIVOS_RZ = ['VENTA DERIVADA PARA CIERRE A SEDE'];
+// LATERAL: última derivación (≤31 días) del DNI de la venta Realzza (alias v).
+const DERIV_LATERAL_RZ = `
+  LEFT JOIN LATERAL (
+    SELECT gr.tipo_base, gr.asesor_realzza, gr.marca_temporal FROM gestion_realzza gr
+    WHERE regexp_replace(gr.dni_cliente, '\\D', '', 'g') = regexp_replace(v.doc_identidad, '\\D', '', 'g')
+      AND gr.motivo_interes = ANY($1)
+      AND gr.marca_temporal::date <= v.fecha_cv
+      AND v.fecha_cv - gr.marca_temporal::date <= 31
+    ORDER BY gr.marca_temporal DESC LIMIT 1
+  ) g ON true`;
+// Margen agregado por CodigoCV (margen_ventas es 1 fila por línea de producto).
+const MARGEN_JOIN = `
+  LEFT JOIN (SELECT codigo_cv, SUM(valor_venta) AS valor_venta, SUM(margen_total) AS margen_total,
+                    MAX(cliente) AS cliente
+             FROM margen_ventas GROUP BY codigo_cv) mg ON mg.codigo_cv = v.codigo_cv`;
+// La lista sale de `ventas` (afectaciones, sede REALZZA STORE) para que SIEMPRE liste
+// TODAS las ventas del mes (derivadas o no), aunque aún no se hayan consolidado. Se
+// hace LEFT JOIN a `ventas_realzza` (vr) para respetar el TipoBase/AsesorVenta ya
+// guardados; si no hay, se muestra la sugerencia de la derivación.
+const ATRIB_SELECT_RZ = `
+  v.codigo_cv, v.dia_cv, v.mes_cv, v.anio_cv, v.sede, v.monto_consolidado, v.cuota_inicial,
+  v.doc_identidad, v.productos, v.cuotas, v.estado_venta,
+  COALESCE(vr.asesor_venta, v.asesor_venta)          AS asesor_venta,
+  v.vendedor, v.entidad,
+  COALESCE(NULLIF(vr.tipo_base, ''), g.tipo_base)     AS tipo_base,
+  v.tipo_credito, vr.tipo_producto, v.dia_af, v.mes_af, v.anio_af,
+  COALESCE(vr.asesor_manual, false)                  AS asesor_manual,
+  g.tipo_base AS tb_sugerido, (g.marca_temporal IS NOT NULL) AS derivado,
+  (g.marca_temporal IS NULL AND (v.anio_cv > 2026 OR (v.anio_cv = 2026 AND v.mes_cv >= 8))) AS sin_derivacion,
+  COALESCE(vr.extranjero, false) AS extranjero,
+  g.asesor_realzza AS asesor_derivacion, g.marca_temporal::date AS fecha_gestion,
+  COALESCE(mg.cliente, v.cliente_venta) AS cliente, mg.valor_venta, mg.margen_total`;
+// FROM común: ventas (afectaciones) + derivación + ventas_realzza (stored) + margen.
+const ATRIB_FROM_RZ = `
+  FROM ventas v ${DERIV_LATERAL_RZ}
+  LEFT JOIN ventas_realzza vr ON vr.codigo_cv = v.codigo_cv
+  ${MARGEN_JOIN}`;
+
+async function ensureAtribRealzza() {
+  await ensureCanalSchema('realzza');   // asegura la tabla ventas_realzza
+  await pgPool.query(`ALTER TABLE ventas_realzza ADD COLUMN IF NOT EXISTS asesor_manual BOOLEAN NOT NULL DEFAULT false`);
+}
+
+// POST /ventas-realzza/cruzar?anio=&mes= — llena el TipoBase VACÍO desde la última
+// derivación en gestion_realzza. Respeta lo que ya tiene y lo marcado a mano.
+app.post('/ventas-realzza/cruzar', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAtribRealzza();
+    const cond = ["NOT v.asesor_manual", "(v.tipo_base IS NULL OR v.tipo_base = '')"]; const params = [DERIV_MOTIVOS_RZ];
+    if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`v.anio_cv = $${params.length}`); }
+    if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`v.mes_cv = $${params.length}`); }
+    const { rows } = await pgPool.query(`
+      WITH deriv AS (
+        SELECT v.codigo_cv, g.tipo_base AS tb FROM ventas_realzza v ${DERIV_LATERAL_RZ}
+        WHERE ${cond.join(' AND ')} AND g.tipo_base IS NOT NULL AND g.tipo_base <> ''
+      )
+      UPDATE ventas_realzza v SET tipo_base = deriv.tb, updated_at = now()
+      FROM deriv WHERE v.codigo_cv = deriv.codigo_cv
+      RETURNING v.codigo_cv`, params);
+    // Total de ventas del mes con derivación (para mostrar el total con cruce).
+    const totCond = []; const totParams = [DERIV_MOTIVOS_RZ];
+    if (req.query.anio) { totParams.push(parseInt(req.query.anio, 10)); totCond.push(`v.anio_cv = $${totParams.length}`); }
+    if (req.query.mes)  { totParams.push(parseInt(req.query.mes, 10));  totCond.push(`v.mes_cv = $${totParams.length}`); }
+    const totWhere = totCond.length ? 'WHERE ' + totCond.join(' AND ') + ' AND g.marca_temporal IS NOT NULL' : 'WHERE g.marca_temporal IS NOT NULL';
+    const { rows: tot } = await pgPool.query(`
+      SELECT COUNT(*)::int n FROM ventas_realzza v ${DERIV_LATERAL_RZ} ${totWhere}`, totParams);
+    res.json({ success: true, actualizados: rows.length, total: tot[0].n });
+  } catch (e) { console.error('❌ POST /ventas-realzza/cruzar:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// GET /ventas-realzza/atribucion?anio=&mes= — TODAS las ventas Realzza del mes con su
+// TipoBase, si están derivadas, y margen/valor de venta (margen_ventas). Para la lista.
+app.get('/ventas-realzza/atribucion', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAtribRealzza();
+    // TODAS las ventas SEDE REALZZA STORE del mes con monto > 0 (derivadas o no).
+    const cond = ["v.sede ILIKE '%REALZZA%'", 'v.monto_consolidado > 0']; const params = [DERIV_MOTIVOS_RZ];
+    if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`v.anio_cv = $${params.length}`); }
+    if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`v.mes_cv = $${params.length}`); }
+    const { rows } = await pgPool.query(`
+      SELECT ${ATRIB_SELECT_RZ}
+      ${ATRIB_FROM_RZ}
+      WHERE ${cond.join(' AND ')}
+      ORDER BY v.fecha_cv DESC NULLS LAST, v.codigo_cv DESC`, params);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /ventas-realzza/atribucion:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// GET /ventas-realzza/buscar?dni=&anio=&mes= — busca ese DNI en las ventas Realzza del mes.
+app.get('/ventas-realzza/buscar', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAtribRealzza();
+    const dni = String(req.query.dni || '').replace(/\D/g, '');
+    if (!dni) return res.json([]);
+    const cond = [`regexp_replace(v.doc_identidad, '\\D', '', 'g') = $2`, "v.sede ILIKE '%REALZZA%'"];
+    const params = [DERIV_MOTIVOS_RZ, dni];
+    if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`v.anio_cv = $${params.length}`); }
+    if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`v.mes_cv = $${params.length}`); }
+    const { rows } = await pgPool.query(`
+      SELECT ${ATRIB_SELECT_RZ}
+      ${ATRIB_FROM_RZ}
+      WHERE ${cond.join(' AND ')}
+      ORDER BY v.fecha_cv DESC NULLS LAST`, params);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /ventas-realzza/buscar:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// PUT /ventas-realzza/:codigo — edita a mano TipoBase / AsesorVenta (protege del re-cruce).
+app.put('/ventas-realzza/:codigo', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAtribRealzza();
+    const b = req.body || {};
+    const sets = []; const vals = [];
+    const add = (col, val, upper = false) => {
+      let s = String(val ?? '').trim(); if (upper) s = s.toUpperCase();
+      vals.push(s || null); sets.push(`${col} = $${vals.length}`);
+    };
+    if (b.tipo_base    !== undefined) add('tipo_base',    b.tipo_base);
+    if (b.asesor_venta !== undefined) add('asesor_venta', b.asesor_venta);
+    if (b.extranjero   !== undefined) { vals.push(!!b.extranjero); sets.push(`extranjero = $${vals.length}`); }
+    if (!sets.length) return res.status(400).json({ success: false, message: 'Nada para actualizar.' });
+    sets.push('asesor_manual = true', 'updated_at = now()');
+    const codigo = parseInt(req.params.codigo, 10);
+    // La lista sale de `ventas`; si la venta aún no está en ventas_realzza, se inserta
+    // primero (desde `ventas`) para poder editarla y persistir el cambio.
+    await pgPool.query(`
+      INSERT INTO ventas_realzza (codigo_cv, dia_cv, mes_cv, anio_cv, sede, monto_consolidado, cuota_inicial,
+        doc_identidad, productos, cuotas, estado_venta, asesor_venta, vendedor, entidad, tipo_credito, tipo_producto, dia_af, mes_af, anio_af, sin_derivacion)
+      SELECT v.codigo_cv, v.dia_cv, v.mes_cv, v.anio_cv, v.sede, v.monto_consolidado, v.cuota_inicial,
+        v.doc_identidad, v.productos, v.cuotas, v.estado_venta, v.asesor_venta, v.vendedor, v.entidad, v.tipo_credito, v.estado_tipo_producto, v.dia_af, v.mes_af, v.anio_af,
+        (g.marca_temporal IS NULL AND (v.anio_cv > 2026 OR (v.anio_cv = 2026 AND v.mes_cv >= 8)))
+      FROM ventas v ${DERIV_LATERAL_RZ}
+      WHERE v.codigo_cv = $2 ON CONFLICT (codigo_cv) DO NOTHING`, [DERIV_MOTIVOS_RZ, codigo]);
+    vals.push(codigo);
+    const { rowCount } = await pgPool.query(
+      `UPDATE ventas_realzza SET ${sets.join(', ')} WHERE codigo_cv = $${vals.length}`, vals);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'Venta no encontrada.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ PUT /ventas-realzza/:codigo:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// POST /ventas-realzza/consolidar?anio=&mes= — agrega a `ventas_realzza` las ventas
+// Realzza (sede 'SEDE REALZZA STORE') que estén en `ventas` (afectaciones) y aún NO
+// existan. SOLO inserta lo nuevo (ON CONFLICT DO NOTHING): NO cambia lo que ya se tiene.
+app.post('/ventas-realzza/consolidar', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAtribRealzza();
+    // $1 = motivos de derivación (para el LATERAL que aporta el TipoBase al insertar).
+    const cond = ["v.sede ILIKE '%REALZZA%'"]; const params = [DERIV_MOTIVOS_RZ];
+    if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`v.anio_cv = $${params.length}`); }
+    if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`v.mes_cv = $${params.length}`); }
+    const cols = ['codigo_cv', 'dia_cv', 'mes_cv', 'anio_cv', 'sede', 'monto_consolidado', 'cuota_inicial',
+      'doc_identidad', 'productos', 'cuotas', 'estado_venta', 'asesor_venta', 'vendedor', 'entidad',
+      'tipo_credito', 'tipo_producto', 'dia_af', 'mes_af', 'anio_af', 'tipo_base', 'sin_derivacion'];
+    // Al insertar lo nuevo, el TipoBase se toma de la última derivación (como el cruce).
+    const { rows } = await pgPool.query(`
+      INSERT INTO ventas_realzza (${cols.join(', ')})
+      SELECT v.codigo_cv, v.dia_cv, v.mes_cv, v.anio_cv, v.sede, v.monto_consolidado, v.cuota_inicial,
+             v.doc_identidad, v.productos, v.cuotas, v.estado_venta, v.asesor_venta, v.vendedor, v.entidad,
+             v.tipo_credito, v.estado_tipo_producto, v.dia_af, v.mes_af, v.anio_af, g.tipo_base,
+             (g.marca_temporal IS NULL AND (v.anio_cv > 2026 OR (v.anio_cv = 2026 AND v.mes_cv >= 8)))
+      FROM ventas v ${DERIV_LATERAL_RZ}
+      WHERE ${cond.join(' AND ')}
+      ON CONFLICT (codigo_cv) DO NOTHING
+      RETURNING codigo_cv`, params);
+    res.json({ success: true, insertados: rows.length });
+  } catch (e) { console.error('❌ POST /ventas-realzza/consolidar:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// GET /ventas-realzza/modulo?anio= — data del MÓDULO Ventas Realzza: UNA fila por venta,
+// base en `ventas` (afectaciones PB, COMPLETO para todos los meses) y cruzando con
+// `ventas_realzza` (atribución) solo para el TipoBase / TipoProducto. Así:
+//   • Estado (NC), fecha de afectación (dia/mes/anio_af), monto y entidad salen de `ventas`.
+//   • Una venta como NC → resta en su mes de AF; si no, cuenta en su mes de venta (CV).
+//   • TipoBase: respeta el de ventas_realzza (Realzza tal cual / CALL manual); si está
+//     vacío, marca 'CALL' por derivación Call — EXCEPTO Brenda (vende como Realzza).
+app.get('/ventas-realzza/modulo', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAtribRealzza();
+    const anio = parseInt(req.query.anio, 10) || new Date().getFullYear();
+    const { rows } = await pgPool.query(`
+      WITH ${MAPA_SQL}
+      SELECT v.codigo_cv, v.dia_cv, v.mes_cv, v.anio_cv, v.sede, v.monto_consolidado, v.cuota_inicial,
+             v.doc_identidad, v.productos, v.cuotas, v.estado_venta, v.entidad, v.vendedor,
+             COALESCE(r.asesor_venta, v.asesor_venta) AS asesor_venta,
+             v.tipo_credito, COALESCE(r.tipo_producto, v.estado_tipo_producto) AS tipo_producto,
+             v.cliente_venta, v.dia_af, v.mes_af, v.anio_af,
+             COALESCE(r.sin_derivacion, false) AS sin_derivacion,
+             COALESCE(r.extranjero, false) AS extranjero,
+             COALESCE(NULLIF(r.tipo_base,''),
+               CASE WHEN m.cc IS NOT NULL AND UPPER(COALESCE(v.vendedor,'')) NOT LIKE '%BERNAL BAZAN BRENDA%' THEN 'CALL' END) AS tipo_base
+      FROM ventas v
+      LEFT JOIN ventas_realzza r ON r.codigo_cv = v.codigo_cv
+      LEFT JOIN LATERAL (
+        SELECT gc.asesor_contact FROM gestion_call gc
+        WHERE regexp_replace(gc.dni_cliente, '\\D', '', 'g') = regexp_replace(v.doc_identidad, '\\D', '', 'g')
+          AND gc.motivo_interes = ANY($1)
+          AND gc.marca_temporal::date <= v.fecha_cv
+          AND v.fecha_cv - gc.marca_temporal::date <= 31
+        ORDER BY gc.marca_temporal DESC LIMIT 1
+      ) g ON true
+      LEFT JOIN mapa m ON UPPER(TRIM(g.asesor_contact)) = m.nombre
+      WHERE v.sede ILIKE '%REALZZA%' AND (v.anio_cv = $2 OR v.anio_af = $2)`, [DERIV_MOTIVOS, anio]);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /ventas-realzza/modulo:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// GET /ventas-realzza/evolutivo — neto REAL mensual para el gráfico evolutivo.
+// Por mes = ventas (Realzza-store, por mes de venta) − NC NO refacturadas (por mes de AF).
+// Una NC es "refacturada" si el mismo cliente tiene otra venta (no NC) ese mismo mes → no
+// resta (se reemplazó). Se acota a los meses que ya tienen ventas en ventas_realzza (evita
+// meses viejos con solo-NC en negativo). Así cada mes coincide con el Monto Real (ventas −
+// NC + refacturación) del módulo.
+app.get('/ventas-realzza/evolutivo', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureAtribRealzza();
+    const { rows } = await pgPool.query(`
+      WITH meses AS (
+        SELECT DISTINCT anio_cv AS anio, mes_cv AS mes FROM ventas_realzza
+        WHERE UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND monto_consolidado > 0
+          AND anio_cv IS NOT NULL AND mes_cv IS NOT NULL
+      ),
+      ven AS (
+        SELECT anio_cv AS anio, mes_cv AS mes, SUM(monto_consolidado) AS monto FROM ventas
+        WHERE sede ILIKE '%REALZZA%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND monto_consolidado > 0
+        GROUP BY anio_cv, mes_cv
+      ),
+      ncnr AS (
+        -- NC que restan: todas por su mes de AF, EXCEPTO las refacturadas (NC del MISMO
+        -- mes CV=AF que tienen una re-venta del mismo cliente ese mes, fecha ≥ la de la NC).
+        SELECT n.anio_af AS anio, n.mes_af AS mes, SUM(n.monto_consolidado) AS monto FROM ventas n
+        WHERE n.sede ILIKE '%REALZZA%' AND UPPER(COALESCE(n.estado_venta,'')) LIKE '%NOTA DE%'
+          AND n.anio_af IS NOT NULL AND n.mes_af IS NOT NULL
+          AND NOT (
+            n.anio_cv = n.anio_af AND n.mes_cv = n.mes_af
+            AND EXISTS (
+              SELECT 1 FROM ventas v2
+              WHERE v2.sede ILIKE '%REALZZA%' AND UPPER(COALESCE(v2.estado_venta,'')) NOT LIKE '%NOTA DE%'
+                AND v2.codigo_cv <> n.codigo_cv
+                AND regexp_replace(v2.doc_identidad,'\\D','','g') = regexp_replace(n.doc_identidad,'\\D','','g')
+                AND v2.anio_cv = n.anio_cv AND v2.mes_cv = n.mes_cv
+                AND v2.fecha_cv >= n.fecha_cv
+            )
+          )
+        GROUP BY n.anio_af, n.mes_af
+      )
+      SELECT m.anio, m.mes,
+             ROUND(COALESCE(ven.monto,0))::int AS ventas,
+             ROUND(COALESCE(ncnr.monto,0))::int AS nc,
+             ROUND(COALESCE(ven.monto,0) - COALESCE(ncnr.monto,0))::int AS neto
+      FROM meses m
+      LEFT JOIN ven  ON ven.anio  = m.anio AND ven.mes  = m.mes
+      LEFT JOIN ncnr ON ncnr.anio = m.anio AND ncnr.mes = m.mes
+      WHERE m.anio > 0 AND m.mes > 0
+      ORDER BY m.anio, m.mes`);
+    res.json(rows);
+  } catch (e) { console.error('❌ GET /ventas-realzza/evolutivo:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

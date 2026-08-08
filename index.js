@@ -495,6 +495,9 @@ async function ensureCanalSchema(canal) {
   await pgPool.query(`ALTER TABLE ${c.tabla} ADD COLUMN IF NOT EXISTS sin_derivacion BOOLEAN NOT NULL DEFAULT false`);
   // Marca manual "extranjero": una venta sin derivación marcada SÍ cuenta al vendedor.
   await pgPool.query(`ALTER TABLE ${c.tabla} ADD COLUMN IF NOT EXISTS extranjero BOOLEAN NOT NULL DEFAULT false`);
+  // Fila atribuida a mano (se copia de ventas.asesor_manual al consolidar). Sirve para que
+  // una venta con DNI vacío (RUC/empresa) atribuida manualmente SÍ cuente al vendedor.
+  await pgPool.query(`ALTER TABLE ${c.tabla} ADD COLUMN IF NOT EXISTS asesor_manual BOOLEAN NOT NULL DEFAULT false`);
   canalSchemaLista[canal] = true;
 }
 
@@ -594,7 +597,7 @@ function registrarCanal(canal, ruta) {
 
       const sql = j
         ? `SELECT r.codigo_cv, r.dia_cv, r.mes_cv, r.anio_cv, r.sede, r.monto_consolidado, r.cuota_inicial,
-                  r.doc_identidad, r.productos, r.cuotas, r.asesor_venta, r.vendedor, r.entidad, r.tipo_base, r.tipo_credito, r.tipo_producto, r.sin_derivacion, r.extranjero, r.fecha_cv,
+                  r.doc_identidad, r.productos, r.cuotas, r.asesor_venta, r.vendedor, r.entidad, r.tipo_base, r.tipo_credito, r.tipo_producto, r.sin_derivacion, r.extranjero, r.asesor_manual, r.fecha_cv,
                   COALESCE(v.estado_venta, r.estado_venta) AS estado_venta,
                   COALESCE(v.dia_af,  r.dia_af)  AS dia_af,
                   COALESCE(v.mes_af,  r.mes_af)  AS mes_af,
@@ -1172,6 +1175,7 @@ app.get('/ventas-realzza/modulo', async (req, res) => {
              v.cliente_venta, v.dia_af, v.mes_af, v.anio_af,
              COALESCE(r.sin_derivacion, false) AS sin_derivacion,
              COALESCE(r.extranjero, false) AS extranjero,
+             COALESCE(r.asesor_manual, false) AS asesor_manual,
              COALESCE(NULLIF(r.tipo_base,''),
                CASE WHEN m.cc IS NOT NULL AND UPPER(COALESCE(v.vendedor,'')) NOT LIKE '%BERNAL BAZAN BRENDA%' THEN 'CALL' END) AS tipo_base
       FROM ventas v

@@ -583,6 +583,9 @@ function registrarCanal(canal, ruta) {
       const px = j ? 'r.' : '';                          // prefijo de columnas base
       const afA = j ? 'COALESCE(v.anio_af, r.anio_af)' : 'anio_af';
       const afM = j ? 'COALESCE(v.mes_af,  r.mes_af)'  : 'mes_af';
+      // Realzza: el vendedor autoritativo es el de `ventas` (base editable) — igual que el
+      // módulo (/modulo). Así una edición del vendedor en `ventas` se refleja en Mi Panel.
+      const vendCol = j ? 'COALESCE(v.vendedor, r.vendedor)' : `${px}vendedor`;
       const cond = [], params = [];
       const anio = req.query.anio ? parseInt(req.query.anio, 10) : null;
       const mes  = req.query.mes  ? parseInt(req.query.mes, 10)  : null;
@@ -592,12 +595,12 @@ function registrarCanal(canal, ruta) {
         cond.push(`((${px}anio_cv = $${pa} AND ${px}mes_cv = $${pm}) OR (${afA} = $${pa} AND ${afM} = $${pm}))`);
       } else if (anio) { params.push(anio); cond.push(`${px}anio_cv = $${params.length}`); }
       if (req.query.sede)     { params.push(`%${String(req.query.sede)}%`); cond.push(`${px}sede ILIKE $${params.length}`); }
-      if (req.query.vendedor) { params.push(String(req.query.vendedor).trim()); cond.push(`${px}vendedor ILIKE $${params.length}`); }
+      if (req.query.vendedor) { params.push(String(req.query.vendedor).trim()); cond.push(`${vendCol} ILIKE $${params.length}`); }
       const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
 
       const sql = j
         ? `SELECT r.codigo_cv, r.dia_cv, r.mes_cv, r.anio_cv, r.sede, r.monto_consolidado, r.cuota_inicial,
-                  r.doc_identidad, r.productos, r.cuotas, r.asesor_venta, r.vendedor, r.entidad, r.tipo_base, r.tipo_credito, r.tipo_producto, r.sin_derivacion, r.extranjero, r.asesor_manual, r.fecha_cv,
+                  r.doc_identidad, r.productos, r.cuotas, r.asesor_venta, COALESCE(v.vendedor, r.vendedor) AS vendedor, r.entidad, r.tipo_base, r.tipo_credito, r.tipo_producto, r.sin_derivacion, r.extranjero, r.asesor_manual, r.fecha_cv,
                   COALESCE(v.estado_venta, r.estado_venta) AS estado_venta,
                   COALESCE(v.dia_af,  r.dia_af)  AS dia_af,
                   COALESCE(v.mes_af,  r.mes_af)  AS mes_af,

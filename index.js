@@ -1154,6 +1154,307 @@ app.put('/ventas-sedes/:codigo', async (req, res) => {
   } catch (e) { console.error('❌ PUT /ventas-sedes/:codigo:', e); res.status(500).json({ success: false, message: e.message }); }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 💰 SUELDO ESTIMADO — VENDEDOR DE PISO/SEDE (réplica del Excel "Comisiones Asesores")
+// Comisión sobre valor de venta: Electro 1.5% + Melamina 3% + Motos 1% (Melamina/Motos
+// van CON IGV, la venta base va SIN IGV, tal cual el Excel). Neto de NC e Incautaciones
+// por MES DE AFECTACIÓN. Bonos: Categoría (derivada de la venta con IGV) y Campañero (si
+// el canal del CAP es CAMPAÑA). Volumen/Reto = Fase 2 (requiere meta por sede).
+const IGV = 1.18;
+const COM_ELECTRO = 0.015, COM_MELAMINA = 0.03, COM_MOTOS = 0.01;
+const RMV_SEDE = 1130, BASICO_SEDE = 400;
+// Categoría por venta CON IGV: [umbral, nombre, bono]
+const CAT_SEDE = [[150000, 'Leo Master', 600], [100000, 'Top Master', 450], [65000, 'Master', 300], [49000, 'Senior', 150]];
+// Bono Campañero por venta CON IGV (solo canal CAMPAÑA): [umbral, bono]
+const CAMPANERO_SEDE = [[50000, 355], [45000, 275], [40000, 250], [35000, 225], [30000, 200], [25000, 100], [20000, 50]];
+// Bono Volumen por venta CON IGV (gate: %logro de meta de la sede ≥ 100%): [umbral, bono]
+const VOLUMEN_SEDE = [[180000, 1000], [151000, 750], [145001, 750], [140001, 700], [135001, 650], [130001, 600],
+  [125001, 550], [120001, 500], [115001, 440], [110001, 420], [105001, 410], [100001, 400], [95001, 360],
+  [90001, 350], [85001, 340], [80001, 300], [75001, 280], [70001, 260], [65001, 240], [60001, 220]];
+const META_LOGRO_GATE = 1.0;   // el Bono Volumen requiere que la sede llegue al 100% de su meta
+
+// Tabla `meta_sede`: meta mensual por sede (input del admin) para el %logro (Bono Volumen/Reto).
+let metaSedeLista = false;
+async function ensureMetaSede() {
+  if (!pgPool || metaSedeLista) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS meta_sede (
+      id BIGSERIAL PRIMARY KEY,
+      sede TEXT NOT NULL,
+      anio INT NOT NULL,
+      mes INT NOT NULL,
+      meta NUMERIC(14,2) NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_meta_sede ON meta_sede (UPPER(sede), anio, mes);`);
+  metaSedeLista = true;
+}
+
+// Total neto (con IGV) de una sede en un mes: ventas positivas − NC/Incautaciones (por mes de
+// afectación). `sedeLike` es el nombre corto (ej. CAYALTI) que hace match ILIKE con ventas.sede.
+async function sedeTotalNeto(sedeLike, anio, mes) {
+  const q = await pgPool.query(
+    `SELECT
+       COALESCE((SELECT SUM(monto_consolidado) FROM ventas
+         WHERE sede ILIKE '%' || $1 || '%' AND mes_cv = $2 AND anio_cv = $3
+           AND UPPER(estado_venta) NOT LIKE '%NOTA DE CR%' AND UPPER(estado_venta) NOT LIKE '%INCAUTAC%'
+           AND UPPER(estado_venta) NOT LIKE '%ANULAD%'), 0)
+     - COALESCE((SELECT SUM(monto_consolidado) FROM ventas
+         WHERE sede ILIKE '%' || $1 || '%' AND mes_af = $2 AND anio_af = $3
+           AND (UPPER(estado_venta) LIKE '%NOTA DE CR%' OR UPPER(estado_venta) LIKE '%INCAUTAC%')), 0) AS total`,
+    [sedeLike, mes, anio]);
+  return +q.rows[0].total;
+}
+
+app.get('/ventas-sedes/sueldo', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    res.set('Cache-Control', 'no-store');
+    const vendedor = String(req.query.vendedor || '').trim();
+    const anio = parseInt(req.query.anio, 10);
+    const mes  = parseInt(req.query.mes, 10);
+    if (!vendedor || !anio || !mes) return res.status(400).json({ success: false, message: 'Faltan vendedor, anio y mes.' });
+
+    // K (venta sin IGV) + melamina/motos (sin IGV) de las ventas del vendedor con mes_cv=mes,
+    // cruzando el detalle por línea (margen_ventas) por codigo_cv.
+    const mg = await pgPool.query(
+      `SELECT COALESCE(SUM(mv.valor_venta),0) AS k,
+         COALESCE(SUM(mv.valor_venta) FILTER (WHERE UPPER(mv.linea_real)='LINEA MELAMINA'),0) AS mel,
+         COALESCE(SUM(mv.valor_venta) FILTER (WHERE UPPER(mv.linea_real)='LINEA MOTOCICLETAS'),0) AS mot
+       FROM margen_ventas mv
+       WHERE mv.codigo_cv IN (
+         SELECT codigo_cv FROM ventas
+         WHERE UPPER(TRIM(vendedor)) = UPPER(TRIM($1)) AND mes_cv = $2 AND anio_cv = $3)`,
+      [vendedor, mes, anio]);
+    // NC e Incautaciones por MES DE AFECTACIÓN (con IGV, como en el Excel).
+    const af = await pgPool.query(
+      `SELECT COALESCE(SUM(monto_consolidado) FILTER (WHERE UPPER(estado_venta) LIKE '%NOTA DE CR%'),0) AS nc,
+              COALESCE(SUM(monto_consolidado) FILTER (WHERE UPPER(estado_venta) LIKE '%INCAUTAC%'),0) AS inc
+       FROM ventas WHERE UPPER(TRIM(vendedor)) = UPPER(TRIM($1)) AND mes_af = $2 AND anio_af = $3`,
+      [vendedor, mes, anio]);
+    // Canal del CAP (para el Bono Campañero). CAMPAÑA* → campañero; RECP* → receptivo.
+    const cap = await pgPool.query(
+      `SELECT canal FROM cap_asesores WHERE UPPER(TRIM(vendedor)) = UPPER(TRIM($1)) LIMIT 1`, [vendedor]);
+
+    const ventaSinIGV = +mg.rows[0].k;
+    const melamina = (+mg.rows[0].mel) * IGV;   // con IGV
+    const motos    = (+mg.rows[0].mot) * IGV;   // con IGV
+    const nc  = +af.rows[0].nc;
+    const inc = +af.rows[0].inc;
+    const ventaConIGV = ventaSinIGV * IGV;      // = L del Excel (para categoría y escalas)
+
+    const baseElectro = (ventaSinIGV - nc - inc) - melamina - motos;
+    const comElectro  = baseElectro > 0 ? baseElectro * COM_ELECTRO : 0;
+    const comMelamina = melamina * COM_MELAMINA;
+    const comMotos    = motos * COM_MOTOS;
+    const totalComisiones = comElectro + comMelamina + comMotos;
+
+    // Categoría (derivada de la venta con IGV) → bono.
+    const cat = CAT_SEDE.find(([u]) => ventaConIGV >= u);
+    const categoria = cat ? cat[1] : 'Sin Categoría';
+    const bonoCategoria = cat ? cat[2] : 0;
+
+    // Bono Campañero: solo si el canal del CAP es CAMPAÑA.
+    const canal = (cap.rows[0]?.canal || '').toString().trim();
+    const canalSinTilde = canal.normalize('NFD').replace(/[̀-ͯ]/g, '');
+    const esCampana = /^CAMP/i.test(canalSinTilde);
+    const escC = CAMPANERO_SEDE.find(([u]) => ventaConIGV >= u);
+    const bonoCampanero = esCampana && escC ? escC[1] : 0;
+
+    // Bono Volumen: gate por %logro de la META de la SEDE del vendedor (≥100%), escala por venta.
+    await ensureMetaSede();
+    let sedeNombre = '', metaSede = 0, sedeTotal = 0, logroSede = 0, bonoVolumen = 0;
+    const sedeRow = await pgPool.query(
+      `SELECT sede FROM ventas WHERE UPPER(TRIM(vendedor)) = UPPER(TRIM($1)) AND mes_cv = $2 AND anio_cv = $3
+         AND sede IS NOT NULL AND sede <> '' GROUP BY sede ORDER BY COUNT(*) DESC LIMIT 1`, [vendedor, mes, anio]);
+    sedeNombre = sedeRow.rows[0]?.sede || '';
+    if (sedeNombre) {
+      const metaRow = await pgPool.query(
+        `SELECT sede, meta FROM meta_sede WHERE $1 ILIKE '%' || sede || '%' AND anio = $2 AND mes = $3
+         ORDER BY LENGTH(sede) DESC LIMIT 1`, [sedeNombre, anio, mes]);
+      if (metaRow.rows[0] && +metaRow.rows[0].meta > 0) {
+        metaSede = +metaRow.rows[0].meta;
+        sedeTotal = await sedeTotalNeto(metaRow.rows[0].sede, anio, mes);
+        logroSede = metaSede > 0 ? sedeTotal / metaSede : 0;
+        if (logroSede >= META_LOGRO_GATE) {
+          const ev = VOLUMEN_SEDE.find(([u]) => ventaConIGV >= u);
+          bonoVolumen = ev ? ev[1] : 0;
+        }
+      }
+    }
+
+    // Adicional por motos GLOBAL GO (per-unit, misma lógica que Call/Realzza): ≥5 → 125 c/u, si no 100.
+    const mgo = await pgPool.query(
+      `SELECT COUNT(*)::int c FROM ventas
+       WHERE UPPER(TRIM(vendedor)) = UPPER(TRIM($1)) AND mes_cv = $2 AND anio_cv = $3
+         AND UPPER(estado_tipo_producto) LIKE '%MOTO%' AND UPPER(entidad) LIKE '%GLOBAL GO%'
+         AND UPPER(estado_venta) NOT LIKE '%NOTA DE CR%' AND UPPER(estado_venta) NOT LIKE '%INCAUTAC%'`,
+      [vendedor, mes, anio]);
+    const motosGlobal = mgo.rows[0].c;
+    const tarifaMoto = motosGlobal >= 5 ? 125 : 100;
+    const pagoMotosGlobal = motosGlobal * tarifaMoto;
+
+    // Sueldo base FIJO (RMV 1130) para todos + comisiones + bonos + adicional motos, todo aditivo.
+    const sueldoBase = RMV_SEDE;
+    const remTotal = sueldoBase + totalComisiones + bonoCategoria + bonoCampanero + bonoVolumen + pagoMotosGlobal;
+
+    const r2 = n => Math.round(n * 100) / 100;
+    res.json({
+      vendedor, anio, mes, canal, esCampana, categoria,
+      ventaSinIGV: r2(ventaSinIGV), ventaConIGV: r2(ventaConIGV),
+      notasCredito: r2(nc), incautaciones: r2(inc),
+      melamina: r2(melamina), motos: r2(motos), baseElectro: r2(baseElectro),
+      comElectro: r2(comElectro), comMelamina: r2(comMelamina), comMotos: r2(comMotos),
+      totalComisiones: r2(totalComisiones),
+      sueldoBase,
+      bonoCategoria, bonoCampanero, bonoVolumen,
+      motosGlobal, tarifaMoto, pagoMotosGlobal: r2(pagoMotosGlobal),
+      sede: sedeNombre, metaSede: r2(metaSede), sedeTotal: r2(sedeTotal), logroSede: r2(logroSede),
+      remTotal: r2(remTotal),
+      nota: 'Estimado a mes completo, neto de NC/Incautaciones. Bono Volumen requiere que la sede llegue al 100% de su meta.',
+    });
+  } catch (e) { console.error('❌ GET /ventas-sedes/sueldo:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🎯 MAESTRO METAS POR SEDE (Fase 2) — meta mensual por sede + %logro (para Bono Volumen)
+// GET /meta-sede?anio=&mes= — una fila por sede (del CAP) con su meta, total real y %logro.
+app.get('/meta-sede', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    res.set('Cache-Control', 'no-store');
+    await ensureMetaSede();
+    const anio = parseInt(req.query.anio, 10), mes = parseInt(req.query.mes, 10);
+    if (!anio || !mes) return res.status(400).json({ success: false, message: 'Faltan anio y mes.' });
+    const sedes = await pgPool.query(
+      `SELECT DISTINCT UPPER(TRIM(sede)) sede FROM cap_asesores
+       WHERE sede IS NOT NULL AND TRIM(sede) <> '' AND UPPER(TRIM(sede)) NOT IN ('TODAS') ORDER BY 1`);
+    const metas = await pgPool.query(`SELECT id, UPPER(sede) sede, meta FROM meta_sede WHERE anio = $1 AND mes = $2`, [anio, mes]);
+    const metaMap = new Map(metas.rows.map(r => [r.sede, r]));
+    const out = [];
+    for (const s of sedes.rows) {
+      const m = metaMap.get(s.sede);
+      const meta = m ? +m.meta : 0;
+      const actual = await sedeTotalNeto(s.sede, anio, mes);
+      out.push({
+        id: m?.id || null, sede: s.sede, anio, mes, meta,
+        actual: Math.round(actual * 100) / 100,
+        logro: meta > 0 ? Math.round((actual / meta) * 1000) / 10 : 0,   // %
+      });
+    }
+    res.json(out);
+  } catch (e) { console.error('❌ GET /meta-sede:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// POST /meta-sede — upsert de la meta de una sede/mes. Body: { sede, anio, mes, meta }.
+app.post('/meta-sede', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureMetaSede();
+    const b = req.body || {};
+    const sede = String(b.sede || '').trim().toUpperCase();
+    const anio = parseInt(b.anio, 10), mes = parseInt(b.mes, 10);
+    const meta = Number(String(b.meta ?? '').replace(/[^0-9.]/g, '')) || 0;
+    if (!sede || !anio || !mes) return res.status(400).json({ success: false, message: 'Faltan sede, anio y mes.' });
+    await pgPool.query(
+      `INSERT INTO meta_sede (sede, anio, mes, meta) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (UPPER(sede), anio, mes) DO UPDATE SET meta = EXCLUDED.meta, updated_at = now()`,
+      [sede, anio, mes, meta]);
+    res.json({ success: true });
+  } catch (e) { console.error('❌ POST /meta-sede:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// DELETE /meta-sede/:id — borra la meta (la sede vuelve a quedar sin meta).
+app.delete('/meta-sede/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureMetaSede();
+    const { rowCount } = await pgPool.query('DELETE FROM meta_sede WHERE id = $1', [parseInt(req.params.id, 10)]);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'Meta no encontrada.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ DELETE /meta-sede/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🎯 MAESTRO METAS POR TIPO DE BASE (Realzza) — meta mensual por tipo de base.
+// Alimenta la columna Meta / %avance de la tabla "Ventas por tipo de base" de Ventas
+// Realzza (antes venía del Excel; ahora editable en BD).
+let metaTipoBaseLista = false;
+async function ensureMetaTipoBase() {
+  if (!pgPool || metaTipoBaseLista) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS meta_tipo_base (
+      id BIGSERIAL PRIMARY KEY,
+      tipo_base TEXT NOT NULL,
+      anio INT NOT NULL,
+      mes INT NOT NULL,
+      meta NUMERIC(14,2) NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_meta_tipo_base ON meta_tipo_base (UPPER(tipo_base), anio, mes);`);
+  metaTipoBaseLista = true;
+}
+
+// GET /meta-tipo-base?anio=&mes= — grid del maestro: un tipo de base (de ventas_realzza)
+// por fila con su meta del mes. GET /meta-tipo-base?anio= (sin mes) → mapa de TODO el año
+// [{tipo_base, anio, mes, meta}] para poblar la tabla de Ventas Realzza.
+app.get('/meta-tipo-base', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    res.set('Cache-Control', 'no-store');
+    await ensureMetaTipoBase();
+    const anio = parseInt(req.query.anio, 10);
+    if (!anio) return res.status(400).json({ success: false, message: 'Falta el anio.' });
+    const mes = req.query.mes ? parseInt(req.query.mes, 10) : null;
+    if (!mes) {
+      // Mapa del año: todas las metas seteadas (para Ventas Realzza).
+      const { rows } = await pgPool.query(
+        `SELECT UPPER(tipo_base) tipo_base, anio, mes, meta FROM meta_tipo_base WHERE anio = $1`, [anio]);
+      return res.json(rows);
+    }
+    // Grid del mes: lista de tipos de base (de ventas_realzza) + su meta.
+    const tipos = await pgPool.query(
+      `SELECT DISTINCT UPPER(TRIM(tipo_base)) tipo_base FROM ventas_realzza
+       WHERE tipo_base IS NOT NULL AND TRIM(tipo_base) <> '' ORDER BY 1`);
+    const metas = await pgPool.query(`SELECT id, UPPER(tipo_base) tipo_base, meta FROM meta_tipo_base WHERE anio = $1 AND mes = $2`, [anio, mes]);
+    const map = new Map(metas.rows.map(r => [r.tipo_base, r]));
+    const out = tipos.rows.map(t => {
+      const m = map.get(t.tipo_base);
+      return { id: m?.id || null, tipo_base: t.tipo_base, anio, mes, meta: m ? +m.meta : 0 };
+    });
+    res.json(out);
+  } catch (e) { console.error('❌ GET /meta-tipo-base:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// POST /meta-tipo-base — upsert. Body: { tipo_base, anio, mes, meta }.
+app.post('/meta-tipo-base', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureMetaTipoBase();
+    const b = req.body || {};
+    const tipo = String(b.tipo_base || '').trim().toUpperCase();
+    const anio = parseInt(b.anio, 10), mes = parseInt(b.mes, 10);
+    const meta = Number(String(b.meta ?? '').replace(/[^0-9.]/g, '')) || 0;
+    if (!tipo || !anio || !mes) return res.status(400).json({ success: false, message: 'Faltan tipo_base, anio y mes.' });
+    await pgPool.query(
+      `INSERT INTO meta_tipo_base (tipo_base, anio, mes, meta) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (UPPER(tipo_base), anio, mes) DO UPDATE SET meta = EXCLUDED.meta, updated_at = now()`,
+      [tipo, anio, mes, meta]);
+    res.json({ success: true });
+  } catch (e) { console.error('❌ POST /meta-tipo-base:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
+// DELETE /meta-tipo-base/:id — borra la meta.
+app.delete('/meta-tipo-base/:id', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    await ensureMetaTipoBase();
+    const { rowCount } = await pgPool.query('DELETE FROM meta_tipo_base WHERE id = $1', [parseInt(req.params.id, 10)]);
+    if (!rowCount) return res.status(404).json({ success: false, message: 'Meta no encontrada.' });
+    res.json({ success: true });
+  } catch (e) { console.error('❌ DELETE /meta-tipo-base/:id:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
 // GET /ventas-realzza/modulo?anio= — data del MÓDULO Ventas Realzza: UNA fila por venta,
 // base en `ventas` (afectaciones PB, COMPLETO para todos los meses) y cruzando con
 // `ventas_realzza` (atribución) solo para el TipoBase / TipoProducto. Así:

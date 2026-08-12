@@ -1517,22 +1517,13 @@ app.get('/ventas-realzza/evolutivo', async (req, res) => {
         GROUP BY anio_cv, mes_cv
       ),
       ncnr AS (
-        -- NC que restan: todas por su mes de AF, EXCEPTO las refacturadas (NC del MISMO
-        -- mes CV=AF que tienen una re-venta del mismo cliente ese mes, fecha ≥ la de la NC).
+        -- NC que restan: SOLO las "arrastradas" (venta de un mes anterior anulada este mes,
+        -- CV ≠ AF). Las NC del MISMO mes (CV=AF) netean a 0 (la venta se hizo y se anuló el
+        -- mismo mes; ya está incluida en el Monto total del módulo) → NO restan.
         SELECT n.anio_af AS anio, n.mes_af AS mes, SUM(n.monto_consolidado) AS monto FROM ventas n
         WHERE n.sede ILIKE '%REALZZA%' AND UPPER(COALESCE(n.estado_venta,'')) LIKE '%NOTA DE%'
           AND n.anio_af IS NOT NULL AND n.mes_af IS NOT NULL
-          AND NOT (
-            n.anio_cv = n.anio_af AND n.mes_cv = n.mes_af
-            AND EXISTS (
-              SELECT 1 FROM ventas v2
-              WHERE v2.sede ILIKE '%REALZZA%' AND UPPER(COALESCE(v2.estado_venta,'')) NOT LIKE '%NOTA DE%'
-                AND v2.codigo_cv <> n.codigo_cv
-                AND regexp_replace(v2.doc_identidad,'\\D','','g') = regexp_replace(n.doc_identidad,'\\D','','g')
-                AND v2.anio_cv = n.anio_cv AND v2.mes_cv = n.mes_cv
-                AND v2.fecha_cv >= n.fecha_cv
-            )
-          )
+          AND NOT (n.anio_cv = n.anio_af AND n.mes_cv = n.mes_af)
         GROUP BY n.anio_af, n.mes_af
       )
       SELECT m.anio, m.mes,

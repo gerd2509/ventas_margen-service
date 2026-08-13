@@ -294,8 +294,9 @@ app.get('/ventas', async (req, res) => {
 });
 
 // GET /ventas/evolutivo — neto REAL mensual por SEDE (todos los meses/años) para el gráfico
-// evolutivo de Ventas Sedes: ventas (por mes CV) − NC no refacturadas (por mes AF) −
-// incautaciones (por mes AF). Devuelve [{sede, anio, mes, ventas, nc, inc, neto}].
+// evolutivo de Ventas Sedes: ventas (por mes CV) menos NC arrastradas (por mes AF) menos
+// incautaciones arrastradas (por mes AF). Las NC/INC del mismo mes (CV=AF) netean a 0.
+// Devuelve [{sede, anio, mes, ventas, nc, inc, neto}].
 app.get('/ventas/evolutivo', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
@@ -308,19 +309,19 @@ app.get('/ventas/evolutivo', async (req, res) => {
         GROUP BY sede, anio_cv, mes_cv
       ),
       ncnr AS (
+        -- Solo restan las NC ARRASTRADAS (venta de un mes anterior anulada este mes).
+        -- Las del mismo mes (CV = AF) netean a 0: su venta no está en 'ven' (que
+        -- excluye los registros NC), así que sumarlas y restarlas se cancela → no restan.
         SELECT n.sede, n.anio_af AS anio, n.mes_af AS mes, SUM(n.monto_consolidado) AS monto FROM ventas n
         WHERE UPPER(COALESCE(n.estado_venta,'')) LIKE '%NOTA DE%' AND n.anio_af IS NOT NULL AND n.mes_af IS NOT NULL
-          AND NOT (n.anio_cv = n.anio_af AND n.mes_cv = n.mes_af AND EXISTS (
-            SELECT 1 FROM ventas v2 WHERE UPPER(COALESCE(v2.estado_venta,'')) NOT LIKE '%NOTA DE%'
-              AND UPPER(COALESCE(v2.estado_venta,'')) NOT LIKE '%INCAUTAC%'
-              AND v2.codigo_cv <> n.codigo_cv AND v2.sede = n.sede
-              AND regexp_replace(v2.doc_identidad,'\\D','','g') = regexp_replace(n.doc_identidad,'\\D','','g')
-              AND v2.anio_cv = n.anio_cv AND v2.mes_cv = n.mes_cv AND v2.fecha_cv >= n.fecha_cv))
+          AND (n.anio_cv IS DISTINCT FROM n.anio_af OR n.mes_cv IS DISTINCT FROM n.mes_af)
         GROUP BY n.sede, n.anio_af, n.mes_af
       ),
       inc AS (
+        -- Igual que las NC: solo restan las incautaciones arrastradas; las del mismo mes netean.
         SELECT sede, anio_af AS anio, mes_af AS mes, SUM(monto_consolidado) AS monto FROM ventas
         WHERE UPPER(COALESCE(estado_venta,'')) LIKE '%INCAUTAC%' AND anio_af IS NOT NULL AND mes_af IS NOT NULL
+          AND (anio_cv IS DISTINCT FROM anio_af OR mes_cv IS DISTINCT FROM mes_af)
         GROUP BY sede, anio_af, mes_af
       ),
       claves AS (
@@ -1477,7 +1478,11 @@ app.get('/ventas-realzza/modulo', async (req, res) => {
              COALESCE(r.asesor_venta, v.asesor_venta) AS asesor_venta,
              v.tipo_credito, COALESCE(r.tipo_producto, v.estado_tipo_producto) AS tipo_producto,
              v.cliente_venta, v.dia_af, v.mes_af, v.anio_af,
-             COALESCE(r.sin_derivacion, false) AS sin_derivacion,
+             -- sin_derivacion se calcula EN VIVO (igual que Atribución Realzza): es true
+             -- solo si NO hay derivación en gestion_realzza para ese DNI (≤31 días antes de
+             -- la venta) y la venta es ago-2026+. NO se lee la columna congelada de
+             -- ventas_realzza (quedaba desactualizada al derivar después de consolidar).
+             (grz.marca_temporal IS NULL AND (v.anio_cv > 2026 OR (v.anio_cv = 2026 AND v.mes_cv >= 8))) AS sin_derivacion,
              COALESCE(r.extranjero, false) AS extranjero,
              COALESCE(r.asesor_manual, false) AS asesor_manual,
              COALESCE(NULLIF(r.tipo_base,''),
@@ -1492,8 +1497,16 @@ app.get('/ventas-realzza/modulo', async (req, res) => {
           AND v.fecha_cv - gc.marca_temporal::date <= 31
         ORDER BY gc.marca_temporal DESC LIMIT 1
       ) g ON true
+      LEFT JOIN LATERAL (
+        SELECT gr.marca_temporal FROM gestion_realzza gr
+        WHERE regexp_replace(gr.dni_cliente, '\\D', '', 'g') = regexp_replace(v.doc_identidad, '\\D', '', 'g')
+          AND gr.motivo_interes = ANY($3)
+          AND gr.marca_temporal::date <= v.fecha_cv
+          AND v.fecha_cv - gr.marca_temporal::date <= 31
+        ORDER BY gr.marca_temporal DESC LIMIT 1
+      ) grz ON true
       LEFT JOIN mapa m ON UPPER(TRIM(g.asesor_contact)) = m.nombre
-      WHERE v.sede ILIKE '%REALZZA%' AND (v.anio_cv = $2 OR v.anio_af = $2)`, [DERIV_MOTIVOS, anio]);
+      WHERE v.sede ILIKE '%REALZZA%' AND (v.anio_cv = $2 OR v.anio_af = $2)`, [DERIV_MOTIVOS, anio, DERIV_MOTIVOS_RZ]);
     res.json(rows);
   } catch (e) { console.error('❌ GET /ventas-realzza/modulo:', e); res.status(500).json({ success: false, message: e.message }); }
 });

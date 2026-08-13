@@ -599,9 +599,28 @@ function registrarCanal(canal, ruta) {
       if (req.query.vendedor) { params.push(String(req.query.vendedor).trim()); cond.push(`${vendCol} ILIKE $${params.length}`); }
       const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
 
+      // Realzza (joinAfect): sin_derivacion se calcula EN VIVO cruzando gestion_realzza
+      // (igual que /modulo y Atribución), NO desde la columna congelada de ventas_realzza.
+      // Así una derivación agregada tras consolidar se refleja en Mi Panel al recargar.
+      let derivLateral = '';
+      let sinDerivExpr = 'r.sin_derivacion';
+      if (j) {
+        params.push(DERIV_MOTIVOS_RZ); const pmot = params.length;
+        derivLateral = `
+           LEFT JOIN LATERAL (
+             SELECT gr.marca_temporal FROM gestion_realzza gr
+             WHERE regexp_replace(gr.dni_cliente, '\\D', '', 'g') = regexp_replace(r.doc_identidad, '\\D', '', 'g')
+               AND gr.motivo_interes = ANY($${pmot})
+               AND gr.marca_temporal::date <= r.fecha_cv
+               AND r.fecha_cv - gr.marca_temporal::date <= 31
+             ORDER BY gr.marca_temporal DESC LIMIT 1
+           ) grz ON true`;
+        sinDerivExpr = '(grz.marca_temporal IS NULL AND (r.anio_cv > 2026 OR (r.anio_cv = 2026 AND r.mes_cv >= 8)))';
+      }
+
       const sql = j
         ? `SELECT r.codigo_cv, r.dia_cv, r.mes_cv, r.anio_cv, r.sede, r.monto_consolidado, r.cuota_inicial,
-                  r.doc_identidad, r.productos, r.cuotas, r.asesor_venta, COALESCE(v.vendedor, r.vendedor) AS vendedor, r.entidad, r.tipo_base, r.tipo_credito, r.tipo_producto, r.sin_derivacion, r.extranjero, r.asesor_manual, r.fecha_cv,
+                  r.doc_identidad, r.productos, r.cuotas, r.asesor_venta, COALESCE(v.vendedor, r.vendedor) AS vendedor, r.entidad, r.tipo_base, r.tipo_credito, r.tipo_producto, ${sinDerivExpr} AS sin_derivacion, r.extranjero, r.asesor_manual, r.fecha_cv,
                   COALESCE(v.estado_venta, r.estado_venta) AS estado_venta,
                   COALESCE(v.dia_af,  r.dia_af)  AS dia_af,
                   COALESCE(v.mes_af,  r.mes_af)  AS mes_af,
@@ -610,7 +629,7 @@ function registrarCanal(canal, ruta) {
                             NULLIF(COALESCE(v.mes_af,  r.mes_af),0),
                             NULLIF(COALESCE(v.dia_af,  r.dia_af),0)) AS fecha_af
            FROM ${c.tabla} r
-           LEFT JOIN ventas v ON v.codigo_cv = r.codigo_cv
+           LEFT JOIN ventas v ON v.codigo_cv = r.codigo_cv${derivLateral}
            ${where}
            ORDER BY r.fecha_cv DESC NULLS LAST, r.codigo_cv DESC`
         : `SELECT * FROM ${c.tabla} ${where} ORDER BY fecha_cv DESC NULLS LAST, codigo_cv DESC`;

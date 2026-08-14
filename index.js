@@ -333,10 +333,17 @@ app.get('/ventas', async (req, res) => {
       cond.push(`anio_cv = $${params.length}`);
     }
     if (req.query.sede) { params.push(`%${String(req.query.sede)}%`); cond.push(`sede ILIKE $${params.length}`); }
+    // Filtro por CLAVES de sede normalizadas (Ventas Sedes: usuarios con sede fija piden
+    // solo su(s) sede(s) → el server NO devuelve las 10 sedes del año → menos egress/payload).
+    // Normaliza sede al mismo formato que el front (quita 'SEDE RELENOR', ñ→n, solo alfanum).
+    if (req.query.sedekeys) {
+      const keys = String(req.query.sedekeys).split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+      if (keys.length) { params.push(keys); cond.push(`regexp_replace(regexp_replace(lower(translate(sede,'ñÑ','nn')),'[^a-z0-9]','','g'),'^sederelenor','') = ANY($${params.length})`); }
+    }
     // Filtro por vendedor (exacto, sin distinguir mayúsculas) → usado por "Mi Panel".
     if (req.query.vendedor) { params.push(String(req.query.vendedor).trim()); cond.push(`vendedor ILIKE $${params.length}`); }
     const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
-    const key = `ventas|${anio}|${mes}|${req.query.sede || ''}|${req.query.vendedor || ''}`;
+    const key = `ventas|${anio}|${mes}|${req.query.sede || ''}|${req.query.sedekeys || ''}|${req.query.vendedor || ''}`;
     const rows = await cached(key, req.query.fresh, async () =>
       (await pgPool.query(
         `SELECT * FROM ventas ${where} ORDER BY fecha_cv DESC NULLS LAST, codigo_cv DESC`, params
@@ -1942,8 +1949,14 @@ app.get('/margen-ventas', async (req, res) => {
     if (req.query.anio) { params.push(parseInt(req.query.anio, 10)); cond.push(`EXTRACT(YEAR FROM fecha) = $${params.length}`); }
     if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`EXTRACT(MONTH FROM fecha) = $${params.length}`); }
     if (req.query.sede) { params.push(`%${String(req.query.sede)}%`); cond.push(`sede ILIKE $${params.length}`); }
+    // Filtro por claves de sede normalizadas (igual que /ventas). margen_ventas.sede viene
+    // SIN el prefijo 'SEDE RELENOR' (p. ej. 'FERREÑAFE'); la normalización lo cubre igual.
+    if (req.query.sedekeys) {
+      const keys = String(req.query.sedekeys).split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+      if (keys.length) { params.push(keys); cond.push(`regexp_replace(regexp_replace(lower(translate(sede,'ñÑ','nn')),'[^a-z0-9]','','g'),'^sederelenor','') = ANY($${params.length})`); }
+    }
     const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
-    const key = `margen-ventas|${req.query.anio || ''}|${req.query.mes || ''}|${req.query.sede || ''}`;
+    const key = `margen-ventas|${req.query.anio || ''}|${req.query.mes || ''}|${req.query.sede || ''}|${req.query.sedekeys || ''}`;
     const rows = await cached(key, req.query.fresh, async () =>
       (await pgPool.query(
         `SELECT * FROM margen_ventas ${where} ORDER BY fecha DESC NULLS LAST, codigo_cv DESC`, params

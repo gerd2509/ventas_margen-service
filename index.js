@@ -31,6 +31,59 @@ const pgPool = process.env.DATABASE_URL
   ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
   : null;
 
+// 🗃️ Caché en memoria de queries de LECTURA pesadas (p. ej. /ventas trae ~16k filas
+// del año, iguales para todos los usuarios). La 1ª petición va a Postgres/Supabase y
+// las siguientes dentro del TTL se sirven de memoria → MENOS EGRESS de Supabase y
+// respuestas más rápidas. Se invalida en cada escritura (import/consolidar/cruzar/PUT/
+// metas). Bypass puntual con ?fresh=1. TTL por env (def. 60s).
+const DB_CACHE_TTL_MS = parseInt(process.env.DB_CACHE_TTL_MS || '60000', 10);
+const queryCache = new Map(); // key -> { ts, data }
+function cacheGet(key) {
+  const hit = queryCache.get(key);
+  if (hit && (Date.now() - hit.ts) < DB_CACHE_TTL_MS) return hit.data;
+  if (hit) queryCache.delete(key);   // expiró → libera memoria
+  return null;
+}
+function cacheSet(key, data) {
+  // Tope de entradas para no presionar la RAM del contenedor (Render). Map conserva
+  // orden de inserción → borra la más antigua.
+  if (queryCache.size >= 60) { const oldest = queryCache.keys().next().value; queryCache.delete(oldest); }
+  queryCache.set(key, { ts: Date.now(), data });
+  return data;
+}
+function cacheClear() { queryCache.clear(); }
+// Sirve `key` desde caché o ejecuta `run()` (async) y lo cachea. `fresh` fuerza refresco.
+async function cached(key, fresh, run) {
+  if (!fresh) { const hit = cacheGet(key); if (hit !== null) return hit; }
+  return cacheSet(key, await run());
+}
+// Invalida TODA la caché de lectura tras cualquier escritura exitosa (import/consolidar/
+// cruzar/PUT/metas). Así una edición se refleja al instante, sin esperar el TTL. Simple y
+// seguro: en el peor caso la siguiente lectura re-consulta la base.
+app.use((req, res, next) => {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
+  res.on('finish', () => { if (res.statusCode < 400) cacheClear(); });
+  next();
+});
+
+// ⚡ Índices de expresión sobre el DNI normalizado. Los cruces de derivación (LATERAL
+// con regexp_replace en /modulo, /atribucion y el GET genérico) sin índice tardaban ~40s;
+// con ellos bajan a ~1s. Idempotente (IF NOT EXISTS) y tolerante a fallos (las tablas
+// gestion_* las crea gestion-service; si aún no existen, se reintenta en el próximo boot).
+async function ensurePerfIndexes() {
+  if (!pgPool) return;
+  const idx = [
+    [`ix_gr_dni_norm`, `gestion_realzza`, `((regexp_replace(dni_cliente,'\\D','','g')))`],
+    [`ix_gc_dni_norm`, `gestion_call`,    `((regexp_replace(dni_cliente,'\\D','','g')))`],
+    [`ix_ventas_docid_norm`, `ventas`,     `((regexp_replace(doc_identidad,'\\D','','g')))`],
+  ];
+  for (const [name, tabla, expr] of idx) {
+    try { await pgPool.query(`CREATE INDEX IF NOT EXISTS ${name} ON ${tabla} ${expr}`); }
+    catch (e) { console.error(`⚠️ ensurePerfIndexes ${name}:`, e.message); }
+  }
+}
+ensurePerfIndexes();
+
 // 📤 Subida de archivos en memoria (Excel). Límite 200 MB.
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
 
@@ -283,9 +336,11 @@ app.get('/ventas', async (req, res) => {
     // Filtro por vendedor (exacto, sin distinguir mayúsculas) → usado por "Mi Panel".
     if (req.query.vendedor) { params.push(String(req.query.vendedor).trim()); cond.push(`vendedor ILIKE $${params.length}`); }
     const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
-    const { rows } = await pgPool.query(
-      `SELECT * FROM ventas ${where} ORDER BY fecha_cv DESC NULLS LAST, codigo_cv DESC`, params
-    );
+    const key = `ventas|${anio}|${mes}|${req.query.sede || ''}|${req.query.vendedor || ''}`;
+    const rows = await cached(key, req.query.fresh, async () =>
+      (await pgPool.query(
+        `SELECT * FROM ventas ${where} ORDER BY fecha_cv DESC NULLS LAST, codigo_cv DESC`, params
+      )).rows);
     res.json(rows);
   } catch (error) {
     console.error('❌ Error en GET /ventas:', error);
@@ -301,7 +356,7 @@ app.get('/ventas/evolutivo', async (req, res) => {
   if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
   try {
     await ensureVentasSchema();
-    const { rows } = await pgPool.query(`
+    const rows = await cached('ventas/evolutivo', req.query.fresh, async () => (await pgPool.query(`
       WITH ven AS (
         SELECT sede, anio_cv AS anio, mes_cv AS mes, SUM(monto_consolidado) AS monto FROM ventas
         WHERE UPPER(COALESCE(estado_venta,'')) NOT LIKE '%NOTA DE%' AND UPPER(COALESCE(estado_venta,'')) NOT LIKE '%INCAUTAC%'
@@ -339,7 +394,7 @@ app.get('/ventas/evolutivo', async (req, res) => {
       LEFT JOIN ncnr ON ncnr.sede = k.sede AND ncnr.anio = k.anio AND ncnr.mes = k.mes
       LEFT JOIN inc  ON inc.sede  = k.sede AND inc.anio  = k.anio AND inc.mes  = k.mes
       WHERE k.anio > 0 AND k.mes > 0
-      ORDER BY k.anio, k.mes`);
+      ORDER BY k.anio, k.mes`)).rows);
     res.json(rows);
   } catch (e) { console.error('❌ GET /ventas/evolutivo:', e); res.status(500).json({ success: false, message: e.message }); }
 });
@@ -634,7 +689,8 @@ function registrarCanal(canal, ruta) {
            ORDER BY r.fecha_cv DESC NULLS LAST, r.codigo_cv DESC`
         : `SELECT * FROM ${c.tabla} ${where} ORDER BY fecha_cv DESC NULLS LAST, codigo_cv DESC`;
 
-      const { rows } = await pgPool.query(sql, params);
+      const key = `${ruta}|${req.query.anio || ''}|${req.query.mes || ''}|${req.query.sede || ''}|${req.query.vendedor || ''}`;
+      const rows = await cached(key, req.query.fresh, async () => (await pgPool.query(sql, params)).rows);
       res.json(rows);
     } catch (error) {
       console.error(`❌ Error en GET /${ruta}:`, error);
@@ -1490,7 +1546,7 @@ app.get('/ventas-realzza/modulo', async (req, res) => {
   try {
     await ensureAtribRealzza();
     const anio = parseInt(req.query.anio, 10) || new Date().getFullYear();
-    const { rows } = await pgPool.query(`
+    const rows = await cached(`realzza/modulo|${anio}`, req.query.fresh, async () => (await pgPool.query(`
       WITH ${MAPA_SQL}
       SELECT v.codigo_cv, v.dia_cv, v.mes_cv, v.anio_cv, v.sede, v.monto_consolidado, v.cuota_inicial,
              v.doc_identidad, v.productos, v.cuotas, v.estado_venta, v.entidad, v.vendedor,
@@ -1525,7 +1581,7 @@ app.get('/ventas-realzza/modulo', async (req, res) => {
         ORDER BY gr.marca_temporal DESC LIMIT 1
       ) grz ON true
       LEFT JOIN mapa m ON UPPER(TRIM(g.asesor_contact)) = m.nombre
-      WHERE v.sede ILIKE '%REALZZA%' AND (v.anio_cv = $2 OR v.anio_af = $2)`, [DERIV_MOTIVOS, anio, DERIV_MOTIVOS_RZ]);
+      WHERE v.sede ILIKE '%REALZZA%' AND (v.anio_cv = $2 OR v.anio_af = $2)`, [DERIV_MOTIVOS, anio, DERIV_MOTIVOS_RZ])).rows);
     res.json(rows);
   } catch (e) { console.error('❌ GET /ventas-realzza/modulo:', e); res.status(500).json({ success: false, message: e.message }); }
 });
@@ -1887,9 +1943,11 @@ app.get('/margen-ventas', async (req, res) => {
     if (req.query.mes)  { params.push(parseInt(req.query.mes, 10));  cond.push(`EXTRACT(MONTH FROM fecha) = $${params.length}`); }
     if (req.query.sede) { params.push(`%${String(req.query.sede)}%`); cond.push(`sede ILIKE $${params.length}`); }
     const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
-    const { rows } = await pgPool.query(
-      `SELECT * FROM margen_ventas ${where} ORDER BY fecha DESC NULLS LAST, codigo_cv DESC`, params
-    );
+    const key = `margen-ventas|${req.query.anio || ''}|${req.query.mes || ''}|${req.query.sede || ''}`;
+    const rows = await cached(key, req.query.fresh, async () =>
+      (await pgPool.query(
+        `SELECT * FROM margen_ventas ${where} ORDER BY fecha DESC NULLS LAST, codigo_cv DESC`, params
+      )).rows);
     res.json(rows);
   } catch (error) {
     console.error('❌ Error en GET /margen-ventas:', error);

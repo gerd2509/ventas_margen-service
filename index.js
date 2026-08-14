@@ -1968,6 +1968,28 @@ app.get('/margen-ventas', async (req, res) => {
   }
 });
 
+// GET /productos?q= — distinct de ventas.productos para el dropdown de Logística
+// (desplegable con búsqueda). Cachea la lista completa 1h en memoria y filtra en RAM;
+// devuelve hasta 50 coincidencias. ~38k productos → cargar todo en el front es inviable.
+let _productosCache = null, _productosTs = 0;
+async function listaProductos() {
+  if (_productosCache && Date.now() - _productosTs < 3600000) return _productosCache;
+  const { rows } = await pgPool.query(
+    `SELECT DISTINCT productos FROM ventas WHERE productos IS NOT NULL AND TRIM(productos) <> '' ORDER BY productos`);
+  _productosCache = rows.map(r => r.productos);
+  _productosTs = Date.now();
+  return _productosCache;
+}
+app.get('/productos', async (req, res) => {
+  if (!pgPool) return res.status(500).json({ success: false, message: 'Base de datos no configurada.' });
+  try {
+    const all = await listaProductos();
+    const q = String(req.query.q || '').trim().toLowerCase();
+    const out = (q ? all.filter(p => p.toLowerCase().includes(q)) : all).slice(0, 50);
+    res.json(out);
+  } catch (e) { console.error('❌ GET /productos:', e); res.status(500).json({ success: false, message: e.message }); }
+});
+
 // ── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({
   ok: true, service: 'ventas-service', db: !!pgPool, ts: new Date().toISOString(),
